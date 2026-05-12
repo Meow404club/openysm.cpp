@@ -11,22 +11,22 @@ const platforms = [_]PlatformSpec{
     .{
         .name = "windows-x64",
         .arch_os_abi = "x86_64-windows-gnu",
-        .extra_flags = &.{ "-msse4.1", "-mfma" },
+        .extra_flags = &.{"-march=x86-64-v3"},
     },
     .{
         .name = "windows-x86",
         .arch_os_abi = "x86-windows-gnu",
-        .extra_flags = &.{ "-msse4.1", "-mfma" },
+        .extra_flags = &.{ "-mavx2", "-mfma", "-mbmi2" },
     },
     .{
         .name = "linux-x64",
         .arch_os_abi = "x86_64-linux-gnu",
-        .extra_flags = &.{ "-msse4.1", "-mfma" },
+        .extra_flags = &.{"-march=x86-64-v3"},
     },
     .{
         .name = "macos-x64",
         .arch_os_abi = "x86_64-macos-none",
-        .extra_flags = &.{ "-msse4.1", "-mfma" },
+        .extra_flags = &.{"-march=x86-64-v3"},
     },
     .{
         .name = "macos-arm64",

@@ -4,7 +4,7 @@
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
   #if defined(__GNUC__) || defined(__clang__)
-    #pragma GCC target("sse4.1,fma")
+    #pragma GCC target("avx2,fma,bmi2")
   #endif
   #include <immintrin.h>
 #elif defined(__aarch64__) || defined(_M_ARM64) || defined(__arm__) || defined(_M_ARM)
@@ -17,6 +17,7 @@
 #include <vector>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <functional>
 #include "jni.h"
 #include <cstdint>
@@ -437,9 +438,40 @@ static const JNINativeMethod gMethods[] = {
     { (char*)"nComputeModelVertices", (char*)"(JLjava/lang/Object;[F[FIIIFFFF)V", reinterpret_cast<void*>(Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nComputeModelVertices) }
 };
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <cpuid.h>
+__attribute__((target("no-avx2,no-fma")))
+static bool hasRequiredCpuSupport() {
+    unsigned int eax, ebx, ecx, edx;
+
+    if (!__get_cpuid(0, &eax, &ebx, &ecx, &edx)) return false;
+    if (eax < 7) return false;
+
+    if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) return false;
+    if (!(ecx & (1u << 12))) return false;
+    if (!(ecx & (1u << 27))) return false;
+    if (!(ecx & (1u << 28))) return false;
+
+    unsigned int xcr0_lo, xcr0_hi;
+    __asm__ volatile(".byte 0x0f, 0x01, 0xd0" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+    if ((xcr0_lo & 0x6) != 0x6) return false;
+
+    if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) return false;
+    if (!(ebx & (1u << 5))) return false;
+
+    return true;
+}
+#else
+static bool hasRequiredCpuSupport() { return true; }
+#endif
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     JNIEnv* env = nullptr;
     if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
+
+    if (!hasRequiredCpuSupport()) {
+        return JNI_ERR;
+    }
 
     jclass clazzModel = env->FindClass("com/elfmcys/yesstevemodel/geckolib3/geo/render/built/GeoModel");
     if (clazzModel == nullptr) return JNI_ERR;

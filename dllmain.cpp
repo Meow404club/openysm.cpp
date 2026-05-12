@@ -123,12 +123,6 @@ struct NativeModel {
     std::vector<Mat4> cacheGlobalNormals;
     std::vector<PrecomputedBoneMats> cachePrecompMats;
     std::vector<int> visibleBones;
-
-    jfloatArray cachedFloatArray = nullptr;
-    int cachedFloatCapacity = 0;
-
-    jintArray cachedIntArray = nullptr;
-    int cachedIntCapacity = 0;
 };
 
 extern "C" {
@@ -228,8 +222,10 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
     NativeModel* model = reinterpret_cast<NativeModel*>(handle);
     if (!model || model->fastQuads.empty()) return;
 
-    jfloat* matricesData = env->GetFloatArrayElements(matrixArray, nullptr);
-    jfloat* animData = env->GetFloatArrayElements(animArray, nullptr);
+    const __m128 rgba = _mm_setr_ps(r, g, b, a);
+
+    jfloat* matricesData = static_cast<jfloat*>(env->GetPrimitiveArrayCritical(matrixArray, nullptr));
+    jfloat* animData     = static_cast<jfloat*>(env->GetPrimitiveArrayCritical(animArray, nullptr));
 
     Mat4 rootPoseMat(matricesData);
     float* rootNormalArr = matricesData + 16;
@@ -288,16 +284,16 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         localMat.m[14] = dz - (localMat.m[2] * px + localMat.m[6] * py + localMat.m[10] * pz);
         localMat.m[15] = 1.0f;
 
-        Mat4 parentGlobal = (bone.parentIdx != -1) ? model->cacheGlobalTransforms[bone.parentIdx] : rootPoseMat;
-        Mat4 globalMat = parentGlobal;
+        const Mat4& parentGlobal = (bone.parentIdx != -1) ? model->cacheGlobalTransforms[bone.parentIdx] : rootPoseMat;
+        Mat4& globalMat = model->cacheGlobalTransforms[bIdx];
+        globalMat = parentGlobal;
         globalMat.mul(localMat);
-        model->cacheGlobalTransforms[bIdx] = globalMat;
 
-        Mat4 parentNormal = (bone.parentIdx != -1) ? model->cacheGlobalNormals[bone.parentIdx] : rootNormalMat;
+        const Mat4& parentNormal = (bone.parentIdx != -1) ? model->cacheGlobalNormals[bone.parentIdx] : rootNormalMat;
         Mat4 localNormalMat = localMat.normalMatrix4x4();
-        Mat4 globalNormalMat = parentNormal;
+        Mat4& globalNormalMat = model->cacheGlobalNormals[bIdx];
+        globalNormalMat = parentNormal;
         globalNormalMat.mul(localNormalMat);
-        model->cacheGlobalNormals[bIdx] = globalNormalMat;
 
         auto& precomp = model->cachePrecompMats[bIdx];
         std::memcpy(precomp.gb, globalMat.m, 16 * sizeof(float));
@@ -330,8 +326,8 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
     }
 
     if (maxVertices == 0) {
-        env->ReleaseFloatArrayElements(matrixArray, matricesData, JNI_ABORT);
-        env->ReleaseFloatArrayElements(animArray, animData, JNI_ABORT);
+        env->ReleasePrimitiveArrayCritical(matrixArray, matricesData, JNI_ABORT);
+        env->ReleasePrimitiveArrayCritical(animArray, animData, JNI_ABORT);
         return;
     }
 
@@ -341,7 +337,7 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
     static thread_local std::vector<float> fData;
     static thread_local std::vector<int> iData;
 
-    fData.reserve(maxFloats);
+    fData.reserve(maxFloats + 4);
     iData.reserve(maxInts);
     
     float* fPtr = fData.data();
@@ -359,6 +355,8 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         if (renderPartMask != 0 && bone.partMask != renderPartMask && bone.partMask != 3) continue;
 
         const auto& pMat = model->cachePrecompMats[bIdx];
+
+        const uint64_t ovl_light64 = (static_cast<uint64_t>(static_cast<uint32_t>(pMat.currentLight)) << 32) | static_cast<uint32_t>(packedOverlay);
 
         __m128 gb0 = _mm_set1_ps(pMat.gb[0]), gb1 = _mm_set1_ps(pMat.gb[1]), gb2 = _mm_set1_ps(pMat.gb[2]);
         __m128 gb4 = _mm_set1_ps(pMat.gb[4]), gb5 = _mm_set1_ps(pMat.gb[5]), gb6 = _mm_set1_ps(pMat.gb[6]);
@@ -399,69 +397,37 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
             sum = _mm_add_ps(sum, _mm_shuffle_ps(sum, sum, _MM_SHUFFLE(1, 0, 3, 2)));
             n_res = _mm_mul_ps(n_res, _mm_rsqrt_ps(_mm_max_ps(sum, _mm_set1_ps(1e-8f))));
 
-            alignas(16) float finalNorm[4];
-            _mm_store_ps(finalNorm, n_res);
-
             alignas(16) float fx[4], fy[4], fz[4], fu[4], fv[4];
             _mm_store_ps(fx, gX); _mm_store_ps(fy, gY); _mm_store_ps(fz, gZ);
             _mm_store_ps(fu, fq.u); _mm_store_ps(fv, fq.v);
 
-
             for (int v = 0; v < 4; ++v) {
-                *fPtr++ = fx[v];
-                *fPtr++ = fy[v];
-                *fPtr++ = fz[v];
-                *fPtr++ = r;
-                *fPtr++ = g;
-                *fPtr++ = b;
-                *fPtr++ = a;
-                *fPtr++ = fu[v];
-                *fPtr++ = fv[v];
-                *fPtr++ = finalNorm[0];
-                *fPtr++ = finalNorm[1];
-                *fPtr++ = finalNorm[2];
+                fPtr[0] = fx[v];
+                fPtr[1] = fy[v];
+                fPtr[2] = fz[v];
+                _mm_storeu_ps(fPtr + 3, rgba);
+                fPtr[7] = fu[v];
+                fPtr[8] = fv[v];
+                _mm_storeu_ps(fPtr + 9, n_res);
+                fPtr += 12;
 
-                *iPtr++ = packedOverlay;
-                *iPtr++ = pMat.currentLight;
+                std::memcpy(iPtr, &ovl_light64, sizeof(uint64_t));
+                iPtr += 2;
             }
 
             actualVertices += 4;
         }
     }
 
-    env->ReleaseFloatArrayElements(matrixArray, matricesData, JNI_ABORT);
-    env->ReleaseFloatArrayElements(animArray, animData, JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(matrixArray, matricesData, JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(animArray, animData, JNI_ABORT);
 
     if (actualVertices > 0 && g_NativeModelRendererClass && g_submitVerticesID) {
-        int actualFloats = actualVertices * 12;
-        int actualInts = actualVertices * 2;
-
-        if (actualFloats > model->cachedFloatCapacity || model->cachedFloatArray == nullptr) {
-            if (model->cachedFloatArray) {
-                env->DeleteGlobalRef(model->cachedFloatArray);
-            }
-            int newCap = actualFloats + (actualFloats / 5) + 1200;
-            jfloatArray localF = env->NewFloatArray(newCap);
-            model->cachedFloatArray = (jfloatArray)env->NewGlobalRef(localF);
-            model->cachedFloatCapacity = newCap;
-            env->DeleteLocalRef(localF);
-        }
-
-        if (actualInts > model->cachedIntCapacity || model->cachedIntArray == nullptr) {
-            if (model->cachedIntArray) {
-                env->DeleteGlobalRef(model->cachedIntArray);
-            }
-            int newCap = actualInts + (actualInts / 5) + 200;
-            jintArray localI = env->NewIntArray(newCap);
-            model->cachedIntArray = (jintArray)env->NewGlobalRef(localI);
-            model->cachedIntCapacity = newCap;
-            env->DeleteLocalRef(localI);
-        }
-
-        env->SetFloatArrayRegion(model->cachedFloatArray, 0, actualFloats, fData.data());
-        env->SetIntArrayRegion(model->cachedIntArray, 0, actualInts, reinterpret_cast<const jint*>(iData.data()));
-
-        env->CallStaticVoidMethod(g_NativeModelRendererClass, g_submitVerticesID, vertexConsumer, actualVertices, model->cachedFloatArray, model->cachedIntArray);
+        jobject fBuf = env->NewDirectByteBuffer(fData.data(), static_cast<jlong>(actualVertices) * 12 * sizeof(float));
+        jobject iBuf = env->NewDirectByteBuffer(iData.data(), static_cast<jlong>(actualVertices) * 2 * sizeof(int));
+        env->CallStaticVoidMethod(g_NativeModelRendererClass, g_submitVerticesID, vertexConsumer, actualVertices, fBuf, iBuf);
+        env->DeleteLocalRef(fBuf);
+        env->DeleteLocalRef(iBuf);
     }
 }
 
@@ -482,7 +448,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     jclass clazzRenderer = env->FindClass("com/elfmcys/yesstevemodel/geckolib3/geo/NativeModelRenderer");
     if (clazzRenderer != nullptr) {
         g_NativeModelRendererClass = (jclass)env->NewGlobalRef(clazzRenderer);
-        g_submitVerticesID = env->GetStaticMethodID(g_NativeModelRendererClass, "submitVertices", "(Ljava/lang/Object;I[F[I)V");
+        g_submitVerticesID = env->GetStaticMethodID(g_NativeModelRendererClass, "submitVertices", "(Ljava/lang/Object;ILjava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)V");
     }
 
     return JNI_VERSION_1_6;

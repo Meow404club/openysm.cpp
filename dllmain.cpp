@@ -929,6 +929,87 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
     env->ReleasePrimitiveArrayCritical(animArray, anim, JNI_ABORT);
 }
 
+JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nComputeBoneMatricesLocal(
+    JNIEnv *env, jclass clazz, jlong handle, jfloatArray animArray, jint packedLight, jobject outBoneBuffer) {
+    auto *mesh = reinterpret_cast<NativeGpuMesh *>(handle);
+    if (!mesh) return;
+
+    auto *outRaw = static_cast<BoneDataOut *>(env->GetDirectBufferAddress(outBoneBuffer));
+    if (!outRaw) return;
+
+    jfloat *anim = static_cast<jfloat *>(env->GetPrimitiveArrayCritical(animArray, nullptr));
+
+    const int glowLight = (15 << 4) | (15 << 20);
+    std::fill(mesh->hiddenInherited.begin(), mesh->hiddenInherited.end(), 0);
+
+    for (int bIdx: mesh->evalOrder) {
+        const NativeBone &bone = mesh->bones[bIdx];
+
+        int pOffset = bIdx * 12;
+        float animRx = anim[pOffset + 0], animRy = anim[pOffset + 1], animRz = anim[pOffset + 2];
+        float animTx = anim[pOffset + 3], animTy = anim[pOffset + 4], animTz = anim[pOffset + 5];
+        float animSx = anim[pOffset + 6], animSy = anim[pOffset + 7], animSz = anim[pOffset + 8];
+        float skipChildrenFlag = anim[pOffset + 10];
+
+        float px = bone.pivotX * 0.0625f, py = bone.pivotY * 0.0625f, pz = bone.pivotZ * 0.0625f;
+        float dx = px - animTx * 0.0625f;
+        float dy = py + animTy * 0.0625f;
+        float dz = pz + animTz * 0.0625f;
+
+        float cx, sx, cy, sy, cz, sz;
+        FAST_SINCOS(animRx, &sx, &cx);
+        FAST_SINCOS(animRy, &sy, &cy);
+        FAST_SINCOS(animRz, &sz, &cz);
+
+        Mat4 localMat(UNINITIALIZED);
+        localMat.m[0] = (cz * cy) * animSx;
+        localMat.m[1] = (sz * cy) * animSx;
+        localMat.m[2] = (-sy) * animSx;
+        localMat.m[3] = 0.0f;
+        localMat.m[4] = (cz * sy * sx - sz * cx) * animSy;
+        localMat.m[5] = (sz * sy * sx + cz * cx) * animSy;
+        localMat.m[6] = (cy * sx) * animSy;
+        localMat.m[7] = 0.0f;
+        localMat.m[8] = (cz * sy * cx + sz * sx) * animSz;
+        localMat.m[9] = (sz * sy * cx - cz * sx) * animSz;
+        localMat.m[10] = (cy * cx) * animSz;
+        localMat.m[11] = 0.0f;
+        localMat.m[12] = dx - (localMat.m[0] * px + localMat.m[4] * py + localMat.m[8] * pz);
+        localMat.m[13] = dy - (localMat.m[1] * px + localMat.m[5] * py + localMat.m[9] * pz);
+        localMat.m[14] = dz - (localMat.m[2] * px + localMat.m[6] * py + localMat.m[10] * pz);
+        localMat.m[15] = 1.0f;
+
+        bool inheritedHidden = (bone.parentIdx != -1) && mesh->hiddenInherited[bone.parentIdx] != 0;
+        bool selfHidden = inheritedHidden || (animSx == 0.0f || animSy == 0.0f || animSz == 0.0f);
+
+        Mat4 &globalMat = mesh->globalTransforms[bIdx];
+        Mat4 localNormalMat = localMat.normalMatrix4x4();
+        Mat4 &globalNormalMat = mesh->globalNormals[bIdx];
+
+        if (bone.parentIdx != -1) {
+            globalMat = mesh->globalTransforms[bone.parentIdx];
+            globalMat.mul(localMat);
+
+            globalNormalMat = mesh->globalNormals[bone.parentIdx];
+            globalNormalMat.mul(localNormalMat);
+        } else {
+            globalMat = localMat;
+            globalNormalMat = localNormalMat;
+        }
+
+        BoneDataOut &out = outRaw[bIdx];
+        std::memcpy(out.transform, globalMat.m, 64);
+        std::memcpy(out.normal, globalNormalMat.m, 64);
+        out.packedLight = bone.glow ? glowLight : packedLight;
+        out.isHidden = selfHidden ? 1 : 0;
+        out.pad[0] = out.pad[1] = 0;
+
+        mesh->hiddenInherited[bIdx] = (selfHidden || skipChildrenFlag != 0.0f) ? 1 : 0;
+    }
+
+    env->ReleasePrimitiveArrayCritical(animArray, anim, JNI_ABORT);
+}
+
 static const JNINativeMethod gMethods[] = {
     {
         (char *) "nInitModelCache", (char *) "(Ljava/nio/ByteBuffer;)J",
@@ -970,6 +1051,11 @@ static const JNINativeMethod gMethods[] = {
         (char *) "nComputeBoneMatrices", (char *) "(J[F[F[FILjava/nio/ByteBuffer;)V",
         reinterpret_cast<void *>(
             Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nComputeBoneMatrices)
+    },
+    {
+        (char *) "nComputeBoneMatricesLocal", (char *) "(J[FILjava/nio/ByteBuffer;)V",
+        reinterpret_cast<void *>(
+            Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nComputeBoneMatricesLocal)
     },
 };
 

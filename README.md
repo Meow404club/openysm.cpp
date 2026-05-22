@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="images/banner.png" alt="logo"/>
-  <h1>OpenYSM SIMD Acceleration</h1>
-  <p>OpenYSM渲染加速器</p>
+  <img src="images/banner.png" alt="logo" width="300"/>
+  <h1>openysm.cpp</h1>
+  <p>C++实现的GPU、SIMD渲染器</p>
 </div>

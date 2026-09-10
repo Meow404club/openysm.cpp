@@ -1,4 +1,36 @@
-﻿#if defined(__GNUC__) || defined(__clang__)
+/*
+ * OpenYSM.cpp — aligned rebuild against the shipped libysm-core.so binary.
+ *
+ * Base: upstream OpenYSMDev/openysm.cpp (MIT, Meow404club fork pin 3e86bb0).
+ * Deviations from upstream are backed by objdump evidence of the shipped
+ * binary in the ModernYSM working area (tmp/native-align/GM_*.asm):
+ *
+ *   [A] nInitSIMD — new export (11th symbol). Caches jfieldID/jmethodID
+ *       handles of the live BufferBuilder subclass so the render hot path can
+ *       write vertices straight into the builder's direct ByteBuffer.
+ *       Evidence: GM_nInitSIMD.asm:1-332 (strings decoded from .rodata
+ *       0xa46a/0xa9c3/0xa95f/0xa7e9/0xa67c/0xa036/0xa02e/0xa975).
+ *   [B] nComputeModelVertices — 5th parameter jfloatArray stateArray inserted
+ *       after animArray (descriptor "(JLjava/lang/Object;[F[F[FIIIFFFF)V").
+ *       When any bone carries animData[bone*12+11] == 1.0f, the native side
+ *       fills stateArray[bone*4 .. bone*4+2] with parentGlobal * T applied to
+ *       (-16, 16, 16). Evidence: GM_nComputeModelVertices.asm scan
+ *       16649-16673 (sentinel, constant 9c50 = 1.0), write 170d5-171c2
+ *       (constants 9c40 = {-16, 16}, 9c58 = 16, bounds 170fb), release
+ *       mode-0 copy-back 19ea0-19ebd.
+ *   [C] translucent byte — nInitModelCache READS the per-quad translucent
+ *       byte written by GeoModel.buildNativeCache() and partitions quads into
+ *       four buckets by (cullable, translucent). Evidence:
+ *       GM_nInitModelCache.asm:375 (movzbl at quad base), :436-469 (four-way
+ *       push targets 15db8/15de0; cullable steers between two list pairs).
+ *   [D] Subtree skip flag still sourced from animData[bone*12+10] with the
+ *       upstream polarity (!= 0.0f skips the subtree). The upstream
+ *       "scale == 0 -> skip subtree" early-out is NOT present in the shipped
+ *       binary. Evidence: GM_nComputeModelVertices.asm 16b04 (load +0x28),
+ *       16a53-16a6f / 1765d-1767a (k-advance decision).
+ */
+
+#if defined(__GNUC__) || defined(__clang__)
 #pragma GCC optimize("O3,unroll-loops")
 #endif
 
@@ -15,6 +47,7 @@
 #endif
 
 #include <vector>
+#include <string>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -43,6 +76,19 @@ inline void ms_sincosf(float x, float *s, float *c) {
 
 static jclass g_NativeModelRendererClass = nullptr;
 static jmethodID g_submitVerticesID = nullptr;
+
+// [A] Cached handles populated by nInitSIMD (GM_nInitSIMD.asm:168-274;
+// bss slots of the shipped binary noted per field).
+static jclass g_BufferBuilderClass = nullptr;          // bss 0x449f8
+static jclass g_SodiumBufferBuilderClass = nullptr;    // bss 0x449e8 (optional)
+static jfieldID g_sodiumBuilderFieldID = nullptr;      // bss 0x449f0 ("builder")
+static jmethodID g_ensureCapacityMethodID = nullptr;   // bss 0x449e0 ("(I)V")
+static jfieldID g_bufferFieldID = nullptr;             // bss 0x44a10 (ByteBuffer)
+static jfieldID g_verticesFieldID = nullptr;           // bss 0x44a00 ("I")
+static jfieldID g_nextElementByteFieldID = nullptr;    // bss 0x44a08 ("I")
+static jfieldID g_modeFieldID = nullptr;               // bss 0x44a28 (cached;
+                                                       // never read back by the
+                                                       // shipped binary)
 
 struct FastQuad {
     int boneIdx;
@@ -135,9 +181,23 @@ struct alignas(16) Mat4 {
     }
 };
 
+// Quad buckets: the shipped binary splits by (cullable, translucent) at parse
+// time [C] and consumes the buckets back-to-back per model render.
+struct QuadBuckets {
+    std::vector<FastQuad> cullable;                    // opaque first
+    std::vector<FastQuad> nonCullable;
+    std::vector<FastQuad> cullableTranslucent;
+    std::vector<FastQuad> nonCullableTranslucent;
+
+    size_t size() const {
+        return cullable.size() + nonCullable.size() +
+               cullableTranslucent.size() + nonCullableTranslucent.size();
+    }
+};
+
 struct NativeModel {
     std::vector<NativeBone> bones;
-    std::vector<FastQuad> fastQuads;
+    QuadBuckets buckets;
     std::vector<int> evalOrder;
 
     std::vector<Mat4> cacheGlobalTransforms;
@@ -194,7 +254,136 @@ static inline uint32_t packNormal_2_10_10_10_REV(float x, float y, float z) {
     return pack(x) | (pack(y) << 10) | (pack(z) << 20);
 }
 
+// ---------------------------------------------------------------------------
+// Begin JNI exports.
+// ---------------------------------------------------------------------------
 extern "C" {
+
+// ---------------------------------------------------------------------------
+// [A] nInitSIMD — rebuilt from GM_nInitSIMD.asm:1-332.
+//
+// Java contract (GeoModel.java:198-220):
+//   nInitSIMD(Class bufferBuilderClass, String bufferName, String verticesName,
+//             String nextElementByteName, String ensureCapacityName,
+//             String modeName, Class vertexFormatModeClass)
+//
+// Asm trace:
+//   :12-32   null-check all 7 args; on failure FindClass@0x30
+//            ("java/lang/IllegalArgumentException", rodata 0xa12b) +
+//            ThrowNew@0x70 ("[OpenYSM.cpp] Missing required arguments for
+//            nInitSIMD", rodata 0xa7ff).
+//   :62-73   GetStringUTFChars@0x548 for the five names.
+//   :77-89   GetObjectClass@0xf8(Mode.class) -> java/lang/Class;
+//            GetMethodID@0x108(Class, "getName"(0xa46a),
+//            "()Ljava/lang/String;"(0xa9c3)); DeleteLocalRef@0xb8.
+//   :97-115  helper 1dde0 = CallObjectMethodV trampoline (full.asm:8167) ->
+//            Mode.class.getName(); GetStringUTFChars on the result.
+//   :115-142 build descriptor: 'L' (0x4c @1bffa) + name with '.'->'/'
+//            (0x2e->0x2f @1c01f-1c031) + ';' (0x3b @1c071).
+//   :168-178 DeleteGlobalRef@0xb0 old, NewGlobalRef@0xa8 new BufferBuilder
+//            class.
+//   :180-236 GetFieldID@0x2f0: buffer -> "Ljava/nio/ByteBuffer;"(0xa95f),
+//            vertices / nextElementByte -> "I"(0xa7e9), mode -> descriptor;
+//            GetMethodID@0x108: ensureCapacity -> "(I)V"(0xa67c);
+//            ExceptionCheck@0x720 between each.
+//   :243-275 FindClass@0x30 SodiumBufferBuilder(0xa036) — optional: absent
+//            class -> ExceptionClear@0x88 and globals stay null; present ->
+//            NewGlobalRef@0xa8 + GetFieldID@0x2f0("builder"(0xa02e),
+//            "Lme/jellysquid/.../ExtendedBufferBuilder;"(0xa975)).
+//   :283-324 ReleaseStringUTFChars@0x550 x5.
+// ---------------------------------------------------------------------------
+JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nInitSIMD(
+    JNIEnv *env, jclass clazz, jclass bufferBuilderClass, jstring bufferName,
+    jstring verticesName, jstring nextElementByteName, jstring ensureCapacityName,
+    jstring modeName, jclass vertexFormatModeClass) {
+    if (!bufferBuilderClass || !bufferName || !verticesName || !nextElementByteName ||
+        !ensureCapacityName || !modeName || !vertexFormatModeClass) {
+        jclass ex = env->FindClass("java/lang/IllegalArgumentException");
+        if (ex) {
+            env->ThrowNew(ex, "[OpenYSM.cpp] Missing required arguments for nInitSIMD");
+        }
+        return;
+    }
+
+    const char *bufferNameC = env->GetStringUTFChars(bufferName, nullptr);
+    const char *verticesNameC = bufferNameC ? env->GetStringUTFChars(verticesName, nullptr) : nullptr;
+    const char *nextElementByteNameC =
+        verticesNameC ? env->GetStringUTFChars(nextElementByteName, nullptr) : nullptr;
+    const char *ensureCapacityNameC =
+        nextElementByteNameC ? env->GetStringUTFChars(ensureCapacityName, nullptr) : nullptr;
+    const char *modeNameC =
+        ensureCapacityNameC ? env->GetStringUTFChars(modeName, nullptr) : nullptr;
+
+    // Build the field descriptor of the Mode enum class at runtime so
+    // remapped game jars keep working (asm 1bf3d-1c076).
+    std::string modeDescriptor;
+    jclass classClass = env->GetObjectClass(vertexFormatModeClass);
+    jmethodID getNameID = classClass
+                              ? env->GetMethodID(classClass, "getName", "()Ljava/lang/String;")
+                              : nullptr;
+    if (classClass) env->DeleteLocalRef(classClass);
+    if (getNameID && !env->ExceptionCheck()) {
+        jstring modeClassName = (jstring) env->CallObjectMethod(vertexFormatModeClass, getNameID);
+        if (modeClassName && !env->ExceptionCheck()) {
+            const char *cn = env->GetStringUTFChars(modeClassName, nullptr);
+            if (cn) {
+                modeDescriptor += 'L';
+                for (const char *p = cn; *p; ++p) {
+                    modeDescriptor += (*p == '.') ? '/' : *p;
+                }
+                modeDescriptor += ';';
+                env->ReleaseStringUTFChars(modeClassName, cn);
+            }
+            env->DeleteLocalRef(modeClassName);
+        } else if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+    }
+
+    if (!modeDescriptor.empty()) {
+        if (g_BufferBuilderClass) env->DeleteGlobalRef(g_BufferBuilderClass);
+        g_BufferBuilderClass = (jclass) env->NewGlobalRef(bufferBuilderClass);
+
+        g_bufferFieldID =
+            env->GetFieldID(g_BufferBuilderClass, bufferNameC, "Ljava/nio/ByteBuffer;");
+        if (env->ExceptionCheck()) goto cleanup;
+        g_verticesFieldID = env->GetFieldID(g_BufferBuilderClass, verticesNameC, "I");
+        if (env->ExceptionCheck()) goto cleanup;
+        g_nextElementByteFieldID =
+            env->GetFieldID(g_BufferBuilderClass, nextElementByteNameC, "I");
+        if (env->ExceptionCheck()) goto cleanup;
+        g_modeFieldID =
+            env->GetFieldID(g_BufferBuilderClass, modeNameC, modeDescriptor.c_str());
+        if (env->ExceptionCheck()) goto cleanup;
+        g_ensureCapacityMethodID =
+            env->GetMethodID(g_BufferBuilderClass, ensureCapacityNameC, "(I)V");
+        if (env->ExceptionCheck()) goto cleanup;
+
+        // Optional Sodium integration; the shipped binary clears the pending
+        // exception when the class is missing (asm 1c1e3-1c254).
+        jclass sodium = env->FindClass(
+            "me/jellysquid/mods/sodium/client/render/vertex/buffer/SodiumBufferBuilder");
+        if (sodium) {
+            g_SodiumBufferBuilderClass = (jclass) env->NewGlobalRef(sodium);
+            g_sodiumBuilderFieldID = env->GetFieldID(
+                g_SodiumBufferBuilderClass, "builder",
+                "Lme/jellysquid/mods/sodium/client/render/vertex/buffer/ExtendedBufferBuilder;");
+            if (!g_sodiumBuilderFieldID) env->ExceptionClear();
+            env->DeleteLocalRef(sodium);
+        } else {
+            env->ExceptionClear();
+        }
+    }
+
+cleanup:
+    if (modeNameC) env->ReleaseStringUTFChars(modeName, modeNameC);
+    if (ensureCapacityNameC) env->ReleaseStringUTFChars(ensureCapacityName, ensureCapacityNameC);
+    if (nextElementByteNameC)
+        env->ReleaseStringUTFChars(nextElementByteName, nextElementByteNameC);
+    if (verticesNameC) env->ReleaseStringUTFChars(verticesName, verticesNameC);
+    if (bufferNameC) env->ReleaseStringUTFChars(bufferName, bufferNameC);
+}
+
 JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nInitModelCache(
     JNIEnv *env, jclass clazz, jobject buffer) {
     char *data = (char *) env->GetDirectBufferAddress(buffer);
@@ -227,7 +416,6 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
     model->cacheGlobalNormals.resize(boneCount);
     model->cachePrecompMats.resize(boneCount);
     model->visibleBones.reserve(boneCount);
-    model->fastQuads.reserve(boneCount * 20);
 
     std::vector<std::vector<int> > children(boneCount);
 
@@ -244,13 +432,22 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
         bone.pivotY = readFloat();
         bone.pivotZ = readFloat();
 
-        bone.quadStart = model->fastQuads.size();
+        bone.quadStart = 0;
+
+        __m128 vminX = _mm_set1_ps(INFINITY), vmaxX = _mm_set1_ps(-INFINITY);
+        __m128 vminY = vminX, vmaxY = vmaxX;
+        __m128 vminZ = vminX, vmaxZ = vmaxX;
 
         int cubeCount = readInt();
         for (int j = 0; j < cubeCount; ++j) {
             bool cullable = readByte() != 0;
             int quadCount = readInt();
             for (int k = 0; k < quadCount; ++k) {
+                // [C] The shipped binary consumes this byte: it selects which
+                // of the four quad buckets the quad lands in
+                // (GM_nInitModelCache.asm:375 movzbl + :436-469).
+                bool translucent = readByte() != 0;
+
                 FastQuad fq;
                 fq.boneIdx = i;
                 fq.cullable = cullable;
@@ -274,24 +471,32 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
                 fq.z = _mm_load_ps(tmpZ);
                 fq.u = _mm_load_ps(tmpU);
                 fq.v = _mm_load_ps(tmpV);
-                model->fastQuads.push_back(fq);
-            }
-        }
-        bone.quadCount = model->fastQuads.size() - bone.quadStart;
 
-        if (bone.quadCount > 0) {
-            __m128 vminX = _mm_set1_ps(INFINITY), vmaxX = _mm_set1_ps(-INFINITY);
-            __m128 vminY = vminX, vmaxY = vmaxX;
-            __m128 vminZ = vminX, vmaxZ = vmaxX;
-            for (int q = bone.quadStart; q < bone.quadStart + bone.quadCount; ++q) {
-                const FastQuad &fq = model->fastQuads[q];
                 vminX = _mm_min_ps(vminX, fq.x);
                 vmaxX = _mm_max_ps(vmaxX, fq.x);
                 vminY = _mm_min_ps(vminY, fq.y);
                 vmaxY = _mm_max_ps(vmaxY, fq.y);
                 vminZ = _mm_min_ps(vminZ, fq.z);
                 vmaxZ = _mm_max_ps(vmaxZ, fq.z);
+
+                if (cullable) {
+                    if (!translucent) {
+                        model->buckets.cullable.push_back(fq);
+                    } else {
+                        model->buckets.cullableTranslucent.push_back(fq);
+                    }
+                } else {
+                    if (!translucent) {
+                        model->buckets.nonCullable.push_back(fq);
+                    } else {
+                        model->buckets.nonCullableTranslucent.push_back(fq);
+                    }
+                }
             }
+        }
+        bone.quadCount = (int) model->buckets.size() - bone.quadStart;
+
+        if (bone.quadCount > 0) {
             auto hmin = [](__m128 v) {
                 v = _mm_min_ps(v, _mm_shuffle_ps(v, v, _MM_SHUFFLE(2, 3, 0, 1)));
                 v = _mm_min_ps(v, _mm_shuffle_ps(v, v, _MM_SHUFFLE(1, 0, 3, 2)));
@@ -313,7 +518,6 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
             bone.aabbMax[0] = bone.aabbMax[1] = bone.aabbMax[2] = 0.0f;
         }
     }
-    model->fastQuads.shrink_to_fit();
 
     std::function<int(int)> dfs = [&](int idx) -> int {
         model->evalOrder.push_back(idx);
@@ -337,18 +541,39 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
     delete reinterpret_cast<NativeModel *>(handle);
 }
 
+// [B] Registered descriptor "(JLjava/lang/Object;[F[F[FIIIFFFF)V" — the extra
+// [F (stateArray) sits right after animArray, matching GeoModel.java:226-236.
 JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nComputeModelVertices(
     JNIEnv *env, jclass clazz, jlong handle, jobject vertexConsumer,
-    jfloatArray matrixArray, jfloatArray animArray,
+    jfloatArray matrixArray, jfloatArray animArray, jfloatArray stateArray,
     jint renderPartMask, jint packedLight, jint packedOverlay,
     jfloat r, jfloat g, jfloat b, jfloat a) {
     NativeModel *model = reinterpret_cast<NativeModel *>(handle);
-    if (!model || model->fastQuads.empty()) return;
+    if (!model || model->buckets.size() == 0) return;
 
-    const __m128 rgba = _mm_setr_ps(r, g, b, a);
+    // [A] Direct-write fast-path availability (asm 16543-165eb):
+    // vertexConsumer != null && ensureCapacity cached && optional Sodium
+    // unwrap && IsInstanceOf(cached BufferBuilder class).
+    bool builderAvailable = false;
+    jobject builder = vertexConsumer;
+    if (vertexConsumer && g_ensureCapacityMethodID) {
+        if (g_SodiumBufferBuilderClass && g_sodiumBuilderFieldID &&
+            env->IsInstanceOf(vertexConsumer, g_SodiumBufferBuilderClass)) {
+            jobject inner = env->GetObjectField(vertexConsumer, g_sodiumBuilderFieldID);
+            if (inner) builder = inner;
+        }
+        builderAvailable = env->IsInstanceOf(builder, g_BufferBuilderClass);
+    }
 
-    jfloat *matricesData = static_cast<jfloat *>(env->GetPrimitiveArrayCritical(matrixArray, nullptr));
-    jfloat *animData = static_cast<jfloat *>(env->GetPrimitiveArrayCritical(animArray, nullptr));
+    jfloat *matricesData;
+    jfloat *animData;
+    if (builderAvailable) {
+        matricesData = env->GetFloatArrayElements(matrixArray, nullptr);
+        animData = env->GetFloatArrayElements(animArray, nullptr);
+    } else {
+        matricesData = (jfloat *) env->GetPrimitiveArrayCritical(matrixArray, nullptr);
+        animData = (jfloat *) env->GetPrimitiveArrayCritical(animArray, nullptr);
+    }
 
     Mat4 rootPoseMat(matricesData);
     float *rootNormalArr = matricesData + 16;
@@ -391,13 +616,45 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
     rootNormalMat.m[14] = 0.0f;
     rootNormalMat.m[15] = 1.0f;
 
-    int glowLight = (15 << 4) | (15 << 20);
-    size_t boneCount = model->bones.size();
+    const int glowLight = (15 << 4) | (15 << 20);
+    const size_t boneCount = model->bones.size();
 
     model->visibleBones.clear();
 
+    // [B] Sentinel scan (asm 16649-16673): stateArray mode activates only when
+    // some bone's animData[bone*12+11] equals 1.0f (rodata 9c50).
+    bool useStateArray = false;
+    for (size_t i = 0; i < boneCount; ++i) {
+        if (animData[i * 12 + 11] == 1.0f) {
+            useStateArray = true;
+            break;
+        }
+    }
+
+    jsize stateLen = 0;
+    jfloat *stateData = nullptr;
+    if (useStateArray && stateArray) {
+        stateLen = env->GetArrayLength(stateArray);
+        if (builderAvailable) {
+            stateData = env->GetFloatArrayElements(stateArray, nullptr);
+        } else {
+            stateData = (jfloat *) env->GetPrimitiveArrayCritical(stateArray, nullptr);
+        }
+    }
+
+    // Quad staging: visible bones, partMask filter, bucket order preserved.
+    struct Staged {
+        const FastQuad *fq;
+        const PrecomputedBoneMats *pMat;
+        bool cullable;
+    };
+    static thread_local std::vector<Staged> staged;
+    staged.clear();
+
+    const __m128 rgba = _mm_setr_ps(r, g, b, a);
+
     int k = 0;
-    while (k < boneCount) {
+    while (k < (int) boneCount) {
         int bIdx = model->evalOrder[k];
         NativeBone &bone = model->bones[bIdx];
 
@@ -405,6 +662,8 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         float animRx = animData[pOffset + 0], animRy = animData[pOffset + 1], animRz = animData[pOffset + 2];
         float animTx = animData[pOffset + 3], animTy = animData[pOffset + 4], animTz = animData[pOffset + 5];
         float animSx = animData[pOffset + 6], animSy = animData[pOffset + 7], animSz = animData[pOffset + 8];
+        // [D] skip flag from animData[+10]; the shipped binary has NO
+        // scale==0 early-out (upstream's was removed).
         float skipChildrenFlag = animData[pOffset + 10];
 
         float px = bone.pivotX * 0.0625f, py = bone.pivotY * 0.0625f, pz = bone.pivotZ * 0.0625f;
@@ -438,12 +697,14 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         localMat.m[14] = dz - (localMat.m[2] * px + localMat.m[6] * py + localMat.m[10] * pz);
         localMat.m[15] = 1.0f;
 
-        const Mat4 &parentGlobal = (bone.parentIdx != -1) ? model->cacheGlobalTransforms[bone.parentIdx] : rootPoseMat;
+        const Mat4 &parentGlobal =
+            (bone.parentIdx != -1) ? model->cacheGlobalTransforms[bone.parentIdx] : rootPoseMat;
         Mat4 &globalMat = model->cacheGlobalTransforms[bIdx];
         globalMat = parentGlobal;
         globalMat.mul(localMat);
 
-        const Mat4 &parentNormal = (bone.parentIdx != -1) ? model->cacheGlobalNormals[bone.parentIdx] : rootNormalMat;
+        const Mat4 &parentNormal =
+            (bone.parentIdx != -1) ? model->cacheGlobalNormals[bone.parentIdx] : rootNormalMat;
         Mat4 localNormalMat = localMat.normalMatrix4x4();
         Mat4 &globalNormalMat = model->cacheGlobalNormals[bIdx];
         globalNormalMat = parentNormal;
@@ -457,34 +718,45 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         precomp.gn_c2 = _mm_load_ps(&globalNormalMat.m[8]);
         precomp.currentLight = bone.glow ? glowLight : packedLight;
 
-        if (animSx == 0.0f || animSy == 0.0f || animSz == 0.0f) {
-            k += bone.subtreeCount + 1;
-            continue;
+        // [B] stateArray write (asm 170d5-171c2): guard animData[+11] == 1.0f
+        // (rodata 9c50) and bounds bIdx*4+2 < stateLen; transform uses the
+        // parent's already-updated global (identity for roots, asm 170a4-17113)
+        // and constants 9c40 = {-16, 16} / 9c58 = {16}.
+        if (stateData && animData[pOffset + 11] == 1.0f && bIdx * 4 + 2 < stateLen) {
+            static const Mat4 identity;
+            const Mat4 &m =
+                (bone.parentIdx != -1) ? model->cacheGlobalTransforms[bone.parentIdx] : identity;
+            float wx = m.m[0] * dx + m.m[4] * dy + m.m[8] * dz + m.m[12];
+            float wy = m.m[1] * dx + m.m[5] * dy + m.m[9] * dz + m.m[13];
+            float wz = m.m[2] * dx + m.m[6] * dy + m.m[10] * dz + m.m[14];
+            stateData[bIdx * 4 + 0] = wx * -16.0f;
+            stateData[bIdx * 4 + 1] = wy * 16.0f;
+            stateData[bIdx * 4 + 2] = wz * 16.0f;
         }
 
         if (cullingEnabled && bone.quadCount > 0) {
             const float *M = globalMat.m;
-            float cx = (bone.aabbMax[0] + bone.aabbMin[0]) * 0.5f;
-            float cy = (bone.aabbMax[1] + bone.aabbMin[1]) * 0.5f;
-            float cz = (bone.aabbMax[2] + bone.aabbMin[2]) * 0.5f;
-            float ex = (bone.aabbMax[0] - bone.aabbMin[0]) * 0.5f;
-            float ey = (bone.aabbMax[1] - bone.aabbMin[1]) * 0.5f;
-            float ez = (bone.aabbMax[2] - bone.aabbMin[2]) * 0.5f;
+            float bcx = (bone.aabbMax[0] + bone.aabbMin[0]) * 0.5f;
+            float bcy = (bone.aabbMax[1] + bone.aabbMin[1]) * 0.5f;
+            float bcz = (bone.aabbMax[2] + bone.aabbMin[2]) * 0.5f;
+            float bex = (bone.aabbMax[0] - bone.aabbMin[0]) * 0.5f;
+            float bey = (bone.aabbMax[1] - bone.aabbMin[1]) * 0.5f;
+            float bez = (bone.aabbMax[2] - bone.aabbMin[2]) * 0.5f;
             float wMin[3], wMax[3];
             for (int row = 0; row < 3; ++row) {
                 float m0 = M[0 * 4 + row], m1 = M[1 * 4 + row], m2 = M[2 * 4 + row], m3 = M[3 * 4 + row];
-                float wc = m0 * cx + m1 * cy + m2 * cz + m3;
-                float we = std::fabs(m0) * ex + std::fabs(m1) * ey + std::fabs(m2) * ez;
+                float wc = m0 * bcx + m1 * bcy + m2 * bcz + m3;
+                float we = std::fabs(m0) * bex + std::fabs(m1) * bey + std::fabs(m2) * bez;
                 wMin[row] = wc - we;
                 wMax[row] = wc + we;
             }
             bool outside = false;
             for (int p = 0; p < 6; ++p) {
-                float a = frustum[p][0], b = frustum[p][1], c = frustum[p][2], d = frustum[p][3];
-                float px = (a >= 0.0f) ? wMax[0] : wMin[0];
-                float py = (b >= 0.0f) ? wMax[1] : wMin[1];
-                float pz = (c >= 0.0f) ? wMax[2] : wMin[2];
-                if (a * px + b * py + c * pz + d < 0.0f) {
+                float fa = frustum[p][0], fb = frustum[p][1], fc = frustum[p][2], fd = frustum[p][3];
+                float ppx = (fa >= 0.0f) ? wMax[0] : wMin[0];
+                float ppy = (fb >= 0.0f) ? wMax[1] : wMin[1];
+                float ppz = (fc >= 0.0f) ? wMax[2] : wMin[2];
+                if (fa * ppx + fb * ppy + fc * ppz + fd < 0.0f) {
                     outside = true;
                     break;
                 }
@@ -503,128 +775,194 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
 
         if (skipChildrenFlag != 0.0f) {
             k += bone.subtreeCount + 1;
-            continue;
+        } else {
+            k++;
         }
-        k++;
     }
 
-    int maxVertices = 0;
-    for (int bIdx: model->visibleBones) {
-        const NativeBone &bone = model->bones[bIdx];
-        if (bone.quadCount == 0) continue;
-        if (renderPartMask != 0 && bone.partMask != renderPartMask && bone.partMask != 3) continue;
-        maxVertices += bone.quadCount * 4;
+    // Stage quads of visible bones. Bucket iteration order (opaque cullable,
+    // opaque non-cullable, translucent cullable, translucent non-cullable)
+    // preserves per-bucket wire order.
+    {
+        auto collectBone = [&](int bIdx) {
+            const NativeBone &bone = model->bones[bIdx];
+            if (bone.quadCount == 0) return;
+            if (renderPartMask != 0 && bone.partMask != renderPartMask && bone.partMask != 3) return;
+            for (const FastQuad &fq: model->buckets.cullable)
+                if (fq.boneIdx == bIdx)
+                    staged.push_back({&fq, &model->cachePrecompMats[bIdx], true});
+            for (const FastQuad &fq: model->buckets.nonCullable)
+                if (fq.boneIdx == bIdx)
+                    staged.push_back({&fq, &model->cachePrecompMats[bIdx], false});
+            for (const FastQuad &fq: model->buckets.cullableTranslucent)
+                if (fq.boneIdx == bIdx)
+                    staged.push_back({&fq, &model->cachePrecompMats[bIdx], true});
+            for (const FastQuad &fq: model->buckets.nonCullableTranslucent)
+                if (fq.boneIdx == bIdx)
+                    staged.push_back({&fq, &model->cachePrecompMats[bIdx], false});
+        };
+        for (int bIdx: model->visibleBones) collectBone(bIdx);
     }
 
-    if (maxVertices == 0) {
-        env->ReleasePrimitiveArrayCritical(matrixArray, matricesData, JNI_ABORT);
-        env->ReleasePrimitiveArrayCritical(animArray, animData, JNI_ABORT);
-        return;
-    }
-
-    int maxFloats = maxVertices * 12;
-    int maxInts = maxVertices * 2;
+    int actualQuads = 0;
 
     static thread_local std::vector<float> fData;
     static thread_local std::vector<int> iData;
+    fData.clear();
+    iData.clear();
+    fData.reserve(staged.size() * 48 + 16);
+    iData.reserve(staged.size() * 8);
 
-    fData.reserve(maxFloats + 4);
-    iData.reserve(maxInts);
+    __m128 proj00 = _mm_set1_ps(projMat.m[0]), proj01 = _mm_set1_ps(projMat.m[4]),
+           proj02 = _mm_set1_ps(projMat.m[8]), proj03 = _mm_set1_ps(projMat.m[12]);
+    __m128 proj10 = _mm_set1_ps(projMat.m[1]), proj11 = _mm_set1_ps(projMat.m[5]),
+           proj12 = _mm_set1_ps(projMat.m[9]), proj13 = _mm_set1_ps(projMat.m[13]);
+    __m128 proj30 = _mm_set1_ps(projMat.m[3]), proj31 = _mm_set1_ps(projMat.m[7]),
+           proj32 = _mm_set1_ps(projMat.m[11]), proj33 = _mm_set1_ps(projMat.m[15]);
 
-    float *fPtr = fData.data();
-    int *iPtr = iData.data();
+    for (const Staged &st: staged) {
+        const FastQuad &fq = *st.fq;
+        const PrecomputedBoneMats &pMat = *st.pMat;
 
-    int actualVertices = 0;
-
-    __m128 p00 = _mm_set1_ps(projMat.m[0]), p01 = _mm_set1_ps(projMat.m[4]), p02 = _mm_set1_ps(projMat.m[8]), p03 =
-            _mm_set1_ps(projMat.m[12]);
-    __m128 p10 = _mm_set1_ps(projMat.m[1]), p11 = _mm_set1_ps(projMat.m[5]), p12 = _mm_set1_ps(projMat.m[9]), p13 =
-            _mm_set1_ps(projMat.m[13]);
-    __m128 p30 = _mm_set1_ps(projMat.m[3]), p31 = _mm_set1_ps(projMat.m[7]), p32 = _mm_set1_ps(projMat.m[11]), p33 =
-            _mm_set1_ps(projMat.m[15]);
-
-    for (int bIdx: model->visibleBones) {
-        const NativeBone &bone = model->bones[bIdx];
-        if (bone.quadCount == 0) continue;
-        if (renderPartMask != 0 && bone.partMask != renderPartMask && bone.partMask != 3) continue;
-
-        const auto &pMat = model->cachePrecompMats[bIdx];
-
-        const uint64_t ovl_light64 = (static_cast<uint64_t>(static_cast<uint32_t>(pMat.currentLight)) << 32) |
-                                     static_cast<uint32_t>(packedOverlay);
+        const uint64_t ovl_light64 =
+            (static_cast<uint64_t>(static_cast<uint32_t>(pMat.currentLight)) << 32) |
+            static_cast<uint32_t>(packedOverlay);
 
         __m128 gb0 = _mm_set1_ps(pMat.gb[0]), gb1 = _mm_set1_ps(pMat.gb[1]), gb2 = _mm_set1_ps(pMat.gb[2]);
         __m128 gb4 = _mm_set1_ps(pMat.gb[4]), gb5 = _mm_set1_ps(pMat.gb[5]), gb6 = _mm_set1_ps(pMat.gb[6]);
         __m128 gb8 = _mm_set1_ps(pMat.gb[8]), gb9 = _mm_set1_ps(pMat.gb[9]), gb10 = _mm_set1_ps(pMat.gb[10]);
         __m128 gb12 = _mm_set1_ps(pMat.gb[12]), gb13 = _mm_set1_ps(pMat.gb[13]), gb14 = _mm_set1_ps(pMat.gb[14]);
 
-        for (int q = 0; q < bone.quadCount; ++q) {
-            const FastQuad &fq = model->fastQuads[bone.quadStart + q];
+        __m128 gX = MADD_PS(gb0, fq.x, MADD_PS(gb4, fq.y, MADD_PS(gb8, fq.z, gb12)));
+        __m128 gY = MADD_PS(gb1, fq.x, MADD_PS(gb5, fq.y, MADD_PS(gb9, fq.z, gb13)));
+        __m128 gZ = MADD_PS(gb2, fq.x, MADD_PS(gb6, fq.y, MADD_PS(gb10, fq.z, gb14)));
 
-            __m128 gX = MADD_PS(gb0, fq.x, MADD_PS(gb4, fq.y, MADD_PS(gb8, fq.z, gb12)));
-            __m128 gY = MADD_PS(gb1, fq.x, MADD_PS(gb5, fq.y, MADD_PS(gb9, fq.z, gb13)));
-            __m128 gZ = MADD_PS(gb2, fq.x, MADD_PS(gb6, fq.y, MADD_PS(gb10, fq.z, gb14)));
+        if (st.cullable) {
+            __m128 pX = MADD_PS(proj00, gX, MADD_PS(proj01, gY, MADD_PS(proj02, gZ, proj03)));
+            __m128 pY = MADD_PS(proj10, gX, MADD_PS(proj11, gY, MADD_PS(proj12, gZ, proj13)));
+            __m128 pW = MADD_PS(proj30, gX, MADD_PS(proj31, gY, MADD_PS(proj32, gZ, proj33)));
 
-            if (fq.cullable) {
-                __m128 pX = MADD_PS(p00, gX, MADD_PS(p01, gY, MADD_PS(p02, gZ, p03)));
-                __m128 pY = MADD_PS(p10, gX, MADD_PS(p11, gY, MADD_PS(p12, gZ, p13)));
-                __m128 pW = MADD_PS(p30, gX, MADD_PS(p31, gY, MADD_PS(p32, gZ, p33)));
+            __m128 pY_120 = _mm_shuffle_ps(pY, pY, _MM_SHUFFLE(3, 0, 2, 1));
+            __m128 pW_201 = _mm_shuffle_ps(pW, pW, _MM_SHUFFLE(3, 1, 0, 2));
+            __m128 pY_201 = _mm_shuffle_ps(pY, pY, _MM_SHUFFLE(3, 1, 0, 2));
+            __m128 pW_120 = _mm_shuffle_ps(pW, pW, _MM_SHUFFLE(3, 0, 2, 1));
 
-                __m128 pY_120 = _mm_shuffle_ps(pY, pY, _MM_SHUFFLE(3, 0, 2, 1));
-                __m128 pW_201 = _mm_shuffle_ps(pW, pW, _MM_SHUFFLE(3, 1, 0, 2));
-                __m128 pY_201 = _mm_shuffle_ps(pY, pY, _MM_SHUFFLE(3, 1, 0, 2));
-                __m128 pW_120 = _mm_shuffle_ps(pW, pW, _MM_SHUFFLE(3, 0, 2, 1));
+            __m128 sub = _mm_sub_ps(_mm_mul_ps(pY_120, pW_201), _mm_mul_ps(pY_201, pW_120));
+            __m128 mx = _mm_mul_ps(pX, sub);
+            __m128 mx1 = _mm_shuffle_ps(mx, mx, _MM_SHUFFLE(1, 1, 1, 1));
+            __m128 mx2 = _mm_shuffle_ps(mx, mx, _MM_SHUFFLE(2, 2, 2, 2));
+            __m128 sum = _mm_add_ps(mx, _mm_add_ps(mx1, mx2));
 
-                __m128 sub = _mm_sub_ps(_mm_mul_ps(pY_120, pW_201), _mm_mul_ps(pY_201, pW_120));
-                __m128 mx = _mm_mul_ps(pX, sub);
-                __m128 mx1 = _mm_shuffle_ps(mx, mx, _MM_SHUFFLE(1, 1, 1, 1));
-                __m128 mx2 = _mm_shuffle_ps(mx, mx, _MM_SHUFFLE(2, 2, 2, 2));
-                __m128 sum = _mm_add_ps(mx, _mm_add_ps(mx1, mx2));
-
-                float det = _mm_cvtss_f32(sum);
-                if (det <= 0.0f) continue;
-            }
-
-            __m128 n_res = MADD_PS(pMat.gn_c0, _mm_set1_ps(fq.nx),
-                                   MADD_PS(pMat.gn_c1, _mm_set1_ps(fq.ny), _mm_mul_ps(pMat.gn_c2, _mm_set1_ps(fq.nz))));
-            __m128 dp = _mm_mul_ps(n_res, n_res);
-            __m128 sum = _mm_add_ps(dp, _mm_shuffle_ps(dp, dp, _MM_SHUFFLE(2, 3, 0, 1)));
-            sum = _mm_add_ps(sum, _mm_shuffle_ps(sum, sum, _MM_SHUFFLE(1, 0, 3, 2)));
-            n_res = _mm_mul_ps(n_res, _mm_rsqrt_ps(_mm_max_ps(sum, _mm_set1_ps(1e-8f))));
-
-            alignas(16) float fx[4], fy[4], fz[4], fu[4], fv[4];
-            _mm_store_ps(fx, gX);
-            _mm_store_ps(fy, gY);
-            _mm_store_ps(fz, gZ);
-            _mm_store_ps(fu, fq.u);
-            _mm_store_ps(fv, fq.v);
-
-            for (int v = 0; v < 4; ++v) {
-                fPtr[0] = fx[v];
-                fPtr[1] = fy[v];
-                fPtr[2] = fz[v];
-                _mm_storeu_ps(fPtr + 3, rgba);
-                fPtr[7] = fu[v];
-                fPtr[8] = fv[v];
-                _mm_storeu_ps(fPtr + 9, n_res);
-                fPtr += 12;
-
-                std::memcpy(iPtr, &ovl_light64, sizeof(uint64_t));
-                iPtr += 2;
-            }
-
-            actualVertices += 4;
+            float det = _mm_cvtss_f32(sum);
+            if (det <= 0.0f) continue;
         }
+
+        __m128 n_res = MADD_PS(pMat.gn_c0, _mm_set1_ps(fq.nx),
+                               MADD_PS(pMat.gn_c1, _mm_set1_ps(fq.ny),
+                                       _mm_mul_ps(pMat.gn_c2, _mm_set1_ps(fq.nz))));
+        __m128 dp = _mm_mul_ps(n_res, n_res);
+        __m128 dsum = _mm_add_ps(dp, _mm_shuffle_ps(dp, dp, _MM_SHUFFLE(2, 3, 0, 1)));
+        dsum = _mm_add_ps(dsum, _mm_shuffle_ps(dsum, dsum, _MM_SHUFFLE(1, 0, 3, 2)));
+        n_res = _mm_mul_ps(n_res, _mm_rsqrt_ps(_mm_max_ps(dsum, _mm_set1_ps(1e-8f))));
+
+        alignas(16) float fx[4], fy[4], fz[4], fu[4], fv[4], fn[4], frgba[4];
+        _mm_store_ps(fx, gX);
+        _mm_store_ps(fy, gY);
+        _mm_store_ps(fz, gZ);
+        _mm_store_ps(fu, fq.u);
+        _mm_store_ps(fv, fq.v);
+        _mm_store_ps(fn, n_res);
+        _mm_store_ps(frgba, rgba);
+
+        size_t base = fData.size();
+        fData.resize(base + 48);
+        for (int v = 0; v < 4; ++v) {
+            float *fp = fData.data() + base + v * 12;
+            fp[0] = fx[v];
+            fp[1] = fy[v];
+            fp[2] = fz[v];
+            std::memcpy(fp + 3, frgba, 16);
+            fp[7] = fu[v];
+            fp[8] = fv[v];
+            fp[9] = fn[0];
+            fp[10] = fn[1];
+            fp[11] = fn[2];
+
+            std::memcpy(iData.data() + iData.size(), &ovl_light64, sizeof(uint64_t));
+            iData.resize(iData.size() + 2);
+        }
+
+        actualQuads++;
     }
 
-    env->ReleasePrimitiveArrayCritical(matrixArray, matricesData, JNI_ABORT);
-    env->ReleasePrimitiveArrayCritical(animArray, animData, JNI_ABORT);
+    int actualVertices = actualQuads * 4;
 
-    if (actualVertices > 0 && g_NativeModelRendererClass && g_submitVerticesID) {
-        jobject fBuf = env->NewDirectByteBuffer(fData.data(), static_cast<jlong>(actualVertices) * 12 * sizeof(float));
-        jobject iBuf = env->NewDirectByteBuffer(iData.data(), static_cast<jlong>(actualVertices) * 2 * sizeof(int));
-        env->CallStaticVoidMethod(g_NativeModelRendererClass, g_submitVerticesID, vertexConsumer, actualVertices, fBuf,
-                                  iBuf);
+    // Release inputs. stateArray releases with mode 0 (copy back) — the
+    // native side wrote it (asm 19ea0-19ebd); matrices/anim use JNI_ABORT.
+    if (stateData) {
+        if (builderAvailable) {
+            env->ReleaseFloatArrayElements(stateArray, stateData, 0);
+        } else {
+            env->ReleasePrimitiveArrayCritical(stateArray, stateData, 0);
+        }
+    }
+    if (builderAvailable) {
+        env->ReleaseFloatArrayElements(matrixArray, matricesData, JNI_ABORT);
+        env->ReleaseFloatArrayElements(animArray, animData, JNI_ABORT);
+    } else {
+        env->ReleasePrimitiveArrayCritical(matrixArray, matricesData, JNI_ABORT);
+        env->ReleasePrimitiveArrayCritical(animArray, animData, JNI_ABORT);
+    }
+
+    if (actualVertices <= 0) return;
+
+    if (builderAvailable && builder) {
+        // [A] Direct-write fast path (asm 189c9-18a54, 19e53-19e9a):
+        //   ensureCapacity(quads*16)                       (189d7-189ea)
+        //   vertices     = GetIntField(builder)            (189fa, 0x320)
+        //   nextElementByte = GetIntField(builder)         (18a1e, 0x320)
+        //   buffer       = GetObjectField + GetDirectBufferAddress
+        //                                                  (18a3b-18a51)
+        //   write quads*144 bytes at [addr + nextElementByte] (4 x 36B records)
+        //   SetIntField(vertices, old + quads*4)           (19e56-19e76, 0x368)
+        //   SetIntField(nextElementByte, old + quads*144)  (19e7c-19e9a, 0x368)
+        env->CallVoidMethod(builder, g_ensureCapacityMethodID, (jint) (actualQuads * 16));
+        if (env->ExceptionCheck()) return;
+
+        jint vertices = env->GetIntField(builder, g_verticesFieldID);
+        jint nextElementByte = env->GetIntField(builder, g_nextElementByteFieldID);
+        jobject bufferObj = env->GetObjectField(builder, g_bufferFieldID);
+        if (!bufferObj) return;
+        void *addr = env->GetDirectBufferAddress(bufferObj);
+        if (!addr) {
+            env->DeleteLocalRef(bufferObj);
+            return;
+        }
+
+        // Per-vertex 36-byte record: pos(3f) rgba(4f) uv(2f) = 9 floats.
+        uint8_t *out = (uint8_t *) addr + nextElementByte;
+        size_t cursor = 0;
+        for (int q = 0; q < actualQuads; ++q) {
+            const float *quad = fData.data() + (size_t) q * 48;
+            for (int v = 0; v < 4; ++v) {
+                const float *src = quad + v * 12;
+                std::memcpy(out + cursor, src, 9 * sizeof(float));
+                cursor += 36;
+            }
+        }
+
+        env->SetIntField(builder, g_verticesFieldID, (jint) (vertices + actualQuads * 4));
+        env->SetIntField(builder, g_nextElementByteFieldID,
+                         (jint) (nextElementByte + (jint) cursor));
+        env->DeleteLocalRef(bufferObj);
+    } else if (g_NativeModelRendererClass && g_submitVerticesID) {
+        // Slow path: submitVertices callback (asm 19b0d-19e40).
+        jobject fBuf = env->NewDirectByteBuffer(
+            fData.data(), static_cast<jlong>(actualVertices) * 12 * sizeof(float));
+        jobject iBuf = env->NewDirectByteBuffer(
+            iData.data(), static_cast<jlong>(actualVertices) * 2 * sizeof(int));
+        env->CallStaticVoidMethod(g_NativeModelRendererClass, g_submitVerticesID, vertexConsumer,
+                                  actualVertices, fBuf, iBuf);
         env->DeleteLocalRef(fBuf);
         env->DeleteLocalRef(iBuf);
     }
@@ -695,6 +1033,10 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
             for (int q = 0; q < qc; ++q) {
                 uint32_t vOff = static_cast<uint32_t>(tmpVerts.size());
 
+                // [C] translucent byte: consumed to keep the wire cursor in
+                // sync with GeoModel.buildNativeCache().
+                (void) readByte();
+
                 float vx[4], vy[4], vz[4], uu[4], vv[4];
                 for (int v = 0; v < 4; ++v) {
                     vx[v] = readFloat();
@@ -743,7 +1085,8 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
 
     mesh->vertexCount = static_cast<int>(tmpVerts.size());
     mesh->vertexData.reset(new GpuVertex[mesh->vertexCount]);
-    std::memcpy(mesh->vertexData.get(), tmpVerts.data(), static_cast<size_t>(mesh->vertexCount) * sizeof(GpuVertex));
+    std::memcpy(mesh->vertexData.get(), tmpVerts.data(),
+                static_cast<size_t>(mesh->vertexCount) * sizeof(GpuVertex));
 
     mesh->indexCount = static_cast<int>(quadRecords.size()) * 6;
     mesh->indexData.reset(new uint32_t[mesh->indexCount]);
@@ -804,14 +1147,16 @@ JNIEXPORT jobject JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_bu
     JNIEnv *env, jclass clazz, jlong handle) {
     auto *mesh = reinterpret_cast<NativeGpuMesh *>(handle);
     if (!mesh || !mesh->vertexData) return nullptr;
-    return env->NewDirectByteBuffer(mesh->vertexData.get(), static_cast<jlong>(mesh->vertexCount) * sizeof(GpuVertex));
+    return env->NewDirectByteBuffer(mesh->vertexData.get(),
+                                    static_cast<jlong>(mesh->vertexCount) * sizeof(GpuVertex));
 }
 
 JNIEXPORT jobject JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nGetGpuMeshIndexBuffer(
     JNIEnv *env, jclass clazz, jlong handle) {
     auto *mesh = reinterpret_cast<NativeGpuMesh *>(handle);
     if (!mesh || !mesh->indexData) return nullptr;
-    return env->NewDirectByteBuffer(mesh->indexData.get(), static_cast<jlong>(mesh->indexCount) * sizeof(uint32_t));
+    return env->NewDirectByteBuffer(mesh->indexData.get(),
+                                    static_cast<jlong>(mesh->indexCount) * sizeof(uint32_t));
 }
 
 JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nReleaseGpuMeshScratch(
@@ -903,12 +1248,14 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         bool inheritedHidden = (bone.parentIdx != -1) && mesh->hiddenInherited[bone.parentIdx] != 0;
         bool selfHidden = inheritedHidden || (animSx == 0.0f || animSy == 0.0f || animSz == 0.0f);
 
-        const Mat4 &parentGlobal = (bone.parentIdx != -1) ? mesh->globalTransforms[bone.parentIdx] : rootPoseMat;
+        const Mat4 &parentGlobal =
+            (bone.parentIdx != -1) ? mesh->globalTransforms[bone.parentIdx] : rootPoseMat;
         Mat4 &globalMat = mesh->globalTransforms[bIdx];
         globalMat = parentGlobal;
         globalMat.mul(localMat);
 
-        const Mat4 &parentNormal = (bone.parentIdx != -1) ? mesh->globalNormals[bone.parentIdx] : rootNormalMat;
+        const Mat4 &parentNormal =
+            (bone.parentIdx != -1) ? mesh->globalNormals[bone.parentIdx] : rootNormalMat;
         Mat4 localNormalMat = localMat.normalMatrix4x4();
         Mat4 &globalNormalMat = mesh->globalNormals[bIdx];
         globalNormalMat = parentNormal;
@@ -930,7 +1277,8 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
 }
 
 JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nComputeBoneMatricesLocal(
-    JNIEnv *env, jclass clazz, jlong handle, jfloatArray animArray, jint packedLight, jobject outBoneBuffer) {
+    JNIEnv *env, jclass clazz, jlong handle, jfloatArray animArray, jint packedLight,
+    jobject outBoneBuffer) {
     auto *mesh = reinterpret_cast<NativeGpuMesh *>(handle);
     if (!mesh) return;
 
@@ -1020,7 +1368,8 @@ static const JNINativeMethod gMethods[] = {
         reinterpret_cast<void *>(Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nDestroyModelCache)
     },
     {
-        (char *) "nComputeModelVertices", (char *) "(JLjava/lang/Object;[F[FIIIFFFF)V",
+        // [B] stateArray inserted after animArray.
+        (char *) "nComputeModelVertices", (char *) "(JLjava/lang/Object;[F[F[FIIIFFFF)V",
         reinterpret_cast<void *>(
             Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nComputeModelVertices)
     },
@@ -1056,6 +1405,14 @@ static const JNINativeMethod gMethods[] = {
         (char *) "nComputeBoneMatricesLocal", (char *) "(J[FILjava/nio/ByteBuffer;)V",
         reinterpret_cast<void *>(
             Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nComputeBoneMatricesLocal)
+    },
+    {
+        // [A] 11th export.
+        (char *) "nInitSIMD",
+        (char *) "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
+                 "Ljava/lang/String;Ljava/lang/String;Ljava/lang/Class;)V",
+        reinterpret_cast<void *>(
+            Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nInitSIMD)
     },
 };
 
@@ -1096,13 +1453,15 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
 
     jclass clazzModel = env->FindClass("com/elfmcys/yesstevemodel/geckolib3/geo/render/built/GeoModel");
     if (clazzModel == nullptr) return JNI_ERR;
-    if (env->RegisterNatives(clazzModel, gMethods, sizeof(gMethods) / sizeof(gMethods[0])) < 0) return JNI_ERR;
+    if (env->RegisterNatives(clazzModel, gMethods, sizeof(gMethods) / sizeof(gMethods[0])) < 0)
+        return JNI_ERR;
 
     jclass clazzRenderer = env->FindClass("com/elfmcys/yesstevemodel/geckolib3/geo/NativeModelRenderer");
     if (clazzRenderer != nullptr) {
         g_NativeModelRendererClass = (jclass) env->NewGlobalRef(clazzRenderer);
-        g_submitVerticesID = env->GetStaticMethodID(g_NativeModelRendererClass, "submitVertices",
-                                                    "(Ljava/lang/Object;ILjava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)V");
+        g_submitVerticesID = env->GetStaticMethodID(
+            g_NativeModelRendererClass, "submitVertices",
+            "(Ljava/lang/Object;ILjava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)V");
     }
 
     return JNI_VERSION_1_6;

@@ -199,6 +199,7 @@ struct NativeModel {
     std::vector<NativeBone> bones;
     QuadBuckets buckets;
     std::vector<int> evalOrder;
+    std::vector<int> evalPos; // evalOrder index per bone (cycle defence)
 
     std::vector<Mat4> cacheGlobalTransforms;
     std::vector<Mat4> cacheGlobalNormals;
@@ -231,6 +232,7 @@ static_assert(sizeof(BoneDataOut) == 144, "BoneDataOut mismatch");
 struct NativeGpuMesh {
     std::vector<NativeBone> bones;
     std::vector<int> evalOrder;
+    std::vector<int> evalPos; // evalOrder index per bone (cycle defence)
     int boneCount = 0;
     std::unique_ptr<GpuVertex[]> vertexData;
     std::unique_ptr<uint32_t[]> indexData;
@@ -416,12 +418,16 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
     model->cacheGlobalNormals.resize(boneCount);
     model->cachePrecompMats.resize(boneCount);
     model->visibleBones.reserve(boneCount);
+    model->evalPos.assign(boneCount, -1);
 
     std::vector<std::vector<int> > children(boneCount);
 
     for (int i = 0; i < boneCount; ++i) {
         NativeBone &bone = model->bones[i];
         bone.parentIdx = readInt();
+        // Non-tree defence: an out-of-range parent would OOB-write children[]
+        // here and leave bones unreachable below.
+        if (bone.parentIdx < -1 || bone.parentIdx >= boneCount) bone.parentIdx = -1;
         if (bone.parentIdx != -1) {
             children[bone.parentIdx].push_back(i);
         }
@@ -519,7 +525,15 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
         }
     }
 
+    // Eval order = pre-order DFS from every root. Non-tree defence: cycles
+    // and orphaned bones would stay unvisited, and the render loop indexes
+    // evalOrder[0..boneCount) -> OOB read (probed SIGSEGV). Guarded DFS
+    // appends leftovers as pseudo-roots; identical output for valid trees.
+    std::vector<char> visited(boneCount, 0);
     std::function<int(int)> dfs = [&](int idx) -> int {
+        if (visited[idx]) return 0;
+        visited[idx] = 1;
+        model->evalPos[idx] = (int) model->evalOrder.size();
         model->evalOrder.push_back(idx);
         int count = 0;
         for (int child: children[idx]) {
@@ -531,6 +545,9 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
 
     for (int i = 0; i < boneCount; ++i) {
         if (model->bones[i].parentIdx == -1) dfs(i);
+    }
+    for (int i = 0; i < boneCount; ++i) {
+        if (!visited[i]) dfs(i);
     }
 
     return reinterpret_cast<jlong>(model);
@@ -668,6 +685,12 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         // mid-chain scale0 -> self+child quads gone with culling disabled).
         float skipChildrenFlag = animData[pOffset + 10];
         const bool zeroScale = (animSx == 0.0f || animSy == 0.0f || animSz == 0.0f);
+        // native-dll-round1: offset9 (HIDDEN) consumption — the shipped
+        // binary ignores it (probed), the CPU path (calculateBoneMatrix)
+        // folds it into visibleCache which propagates to the subtree.
+        // Mirrors that: hidden bone emits no quads, subtree skipped. This
+        // replaces the temporary Java-side hiddenPatchedBoneParams fallback.
+        const bool hiddenSelf = animData[pOffset + 9] != 0.0f;
 
         float px = bone.pivotX * 0.0625f, py = bone.pivotY * 0.0625f, pz = bone.pivotZ * 0.0625f;
         float dx = px - animTx * 0.0625f;
@@ -700,14 +723,20 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         localMat.m[14] = dz - (localMat.m[2] * px + localMat.m[6] * py + localMat.m[10] * pz);
         localMat.m[15] = 1.0f;
 
+        // Cycle defence: a parent that is not evaluated BEFORE this bone in
+        // this pass (cycle/orphan topology) is treated as a root. Without
+        // this, the cached transform from the PREVIOUS pass leaks in and the
+        // output becomes pass-dependent (observed: det flips between passes).
+        const bool parentReady =
+            bone.parentIdx != -1 && model->evalPos[bone.parentIdx] < model->evalPos[bIdx];
         const Mat4 &parentGlobal =
-            (bone.parentIdx != -1) ? model->cacheGlobalTransforms[bone.parentIdx] : rootPoseMat;
+            parentReady ? model->cacheGlobalTransforms[bone.parentIdx] : rootPoseMat;
         Mat4 &globalMat = model->cacheGlobalTransforms[bIdx];
         globalMat = parentGlobal;
         globalMat.mul(localMat);
 
         const Mat4 &parentNormal =
-            (bone.parentIdx != -1) ? model->cacheGlobalNormals[bone.parentIdx] : rootNormalMat;
+            parentReady ? model->cacheGlobalNormals[bone.parentIdx] : rootNormalMat;
         Mat4 localNormalMat = localMat.normalMatrix4x4();
         Mat4 &globalNormalMat = model->cacheGlobalNormals[bIdx];
         globalNormalMat = parentNormal;
@@ -727,8 +756,7 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         // and constants 9c40 = {-16, 16} / 9c58 = {16}.
         if (stateData && animData[pOffset + 11] == 1.0f && bIdx * 4 + 2 < stateLen) {
             static const Mat4 identity;
-            const Mat4 &m =
-                (bone.parentIdx != -1) ? model->cacheGlobalTransforms[bone.parentIdx] : identity;
+            const Mat4 &m = parentReady ? model->cacheGlobalTransforms[bone.parentIdx] : identity;
             float wx = m.m[0] * dx + m.m[4] * dy + m.m[8] * dz + m.m[12];
             float wy = m.m[1] * dx + m.m[5] * dy + m.m[9] * dz + m.m[13];
             float wz = m.m[2] * dx + m.m[6] * dy + m.m[10] * dz + m.m[14];
@@ -765,7 +793,7 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
                 }
             }
             if (outside) {
-                if (skipChildrenFlag != 0.0f || zeroScale) {
+                if (skipChildrenFlag != 0.0f || zeroScale || hiddenSelf) {
                     k += bone.subtreeCount + 1;
                 } else {
                     k++;
@@ -776,11 +804,12 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
 
         // Shipped binary: a zero-scale bone emits no quads and skips its
         // subtree (mirrors the CPU path's visibleCache propagation).
-        if (!zeroScale) {
+        // native-dll-round1: offset9 joins the same skip treatment.
+        if (!zeroScale && !hiddenSelf) {
             model->visibleBones.push_back(bIdx);
         }
 
-        if (skipChildrenFlag != 0.0f || zeroScale) {
+        if (skipChildrenFlag != 0.0f || zeroScale || hiddenSelf) {
             k += bone.subtreeCount + 1;
         } else {
             k++;
@@ -1037,6 +1066,7 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
     mesh->globalTransforms.resize(boneCount);
     mesh->globalNormals.resize(boneCount);
     mesh->hiddenInherited.assign(boneCount, 0);
+    mesh->evalPos.assign(boneCount, -1);
 
     std::vector<std::vector<int> > children(boneCount);
 
@@ -1053,6 +1083,8 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
     for (int i = 0; i < boneCount; ++i) {
         NativeBone &bone = mesh->bones[i];
         bone.parentIdx = readInt();
+        // Non-tree defence, same as nInitModelCache.
+        if (bone.parentIdx < -1 || bone.parentIdx >= boneCount) bone.parentIdx = -1;
         if (bone.parentIdx != -1) children[bone.parentIdx].push_back(i);
         bone.partMask = readInt();
         bone.glow = readByte() != 0;
@@ -1109,7 +1141,12 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
         }
     }
 
+    // Non-tree defence (see nInitModelCache): guarded DFS, leftovers appended.
+    std::vector<char> visited(boneCount, 0);
     std::function<int(int)> dfs = [&](int idx) -> int {
+        if (visited[idx]) return 0;
+        visited[idx] = 1;
+        mesh->evalPos[idx] = (int) mesh->evalOrder.size();
         mesh->evalOrder.push_back(idx);
         int count = 0;
         for (int child: children[idx]) count += dfs(child);
@@ -1118,6 +1155,9 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
     };
     for (int i = 0; i < boneCount; ++i) {
         if (mesh->bones[i].parentIdx == -1) dfs(i);
+    }
+    for (int i = 0; i < boneCount; ++i) {
+        if (!visited[i]) dfs(i);
     }
 
     std::stable_sort(quadRecords.begin(), quadRecords.end(),
@@ -1286,16 +1326,24 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         localMat.m[15] = 1.0f;
 
         bool inheritedHidden = (bone.parentIdx != -1) && mesh->hiddenInherited[bone.parentIdx] != 0;
-        bool selfHidden = inheritedHidden || (animSx == 0.0f || animSy == 0.0f || animSz == 0.0f);
+        // Cycle defence (see nComputeModelVertices): parent not yet evaluated
+        // in this pass -> fall back to the root matrix.
+        const bool parentReady =
+            bone.parentIdx != -1 && mesh->evalPos[bone.parentIdx] < mesh->evalPos[bIdx];
+        // native-dll-round1: offset9 (HIDDEN) joins selfHidden so bone_skin.vsh
+        // folds the hidden bone itself; inherited propagation unchanged, which
+        // also hides the subtree exactly like the CPU visibleCache chain.
+        bool selfHidden = inheritedHidden || (animSx == 0.0f || animSy == 0.0f || animSz == 0.0f)
+                          || anim[pOffset + 9] != 0.0f;
 
         const Mat4 &parentGlobal =
-            (bone.parentIdx != -1) ? mesh->globalTransforms[bone.parentIdx] : rootPoseMat;
+            parentReady ? mesh->globalTransforms[bone.parentIdx] : rootPoseMat;
         Mat4 &globalMat = mesh->globalTransforms[bIdx];
         globalMat = parentGlobal;
         globalMat.mul(localMat);
 
         const Mat4 &parentNormal =
-            (bone.parentIdx != -1) ? mesh->globalNormals[bone.parentIdx] : rootNormalMat;
+            parentReady ? mesh->globalNormals[bone.parentIdx] : rootNormalMat;
         Mat4 localNormalMat = localMat.normalMatrix4x4();
         Mat4 &globalNormalMat = mesh->globalNormals[bIdx];
         globalNormalMat = parentNormal;
@@ -1368,13 +1416,17 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         localMat.m[15] = 1.0f;
 
         bool inheritedHidden = (bone.parentIdx != -1) && mesh->hiddenInherited[bone.parentIdx] != 0;
-        bool selfHidden = inheritedHidden || (animSx == 0.0f || animSy == 0.0f || animSz == 0.0f);
+        // Cycle defence + offset9, same as nComputeBoneMatrices.
+        const bool parentReady =
+            bone.parentIdx != -1 && mesh->evalPos[bone.parentIdx] < mesh->evalPos[bIdx];
+        bool selfHidden = inheritedHidden || (animSx == 0.0f || animSy == 0.0f || animSz == 0.0f)
+                          || anim[pOffset + 9] != 0.0f;
 
         Mat4 &globalMat = mesh->globalTransforms[bIdx];
         Mat4 localNormalMat = localMat.normalMatrix4x4();
         Mat4 &globalNormalMat = mesh->globalNormals[bIdx];
 
-        if (bone.parentIdx != -1) {
+        if (parentReady) {
             globalMat = mesh->globalTransforms[bone.parentIdx];
             globalMat.mul(localMat);
 

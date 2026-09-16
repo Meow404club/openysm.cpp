@@ -495,7 +495,8 @@ public class Runner {
                     fail = "hidden=" + java.util.Arrays.toString(gpuHidden) + " want [0, 1]";
             }
             case "offset9Root" -> {
-                if (slowCount != 0 || fastVertices != 0) fail = "slow=" + slowCount + " fast=" + fastVertices + " want 0/0";
+                // -1 = submitVertices never invoked (zero output)
+                if (slowCount > 0 || fastVertices != 0) fail = "slow=" + slowCount + " fast=" + fastVertices + " want 0/0";
                 if (fail == null && !java.util.Arrays.equals(gpuHidden, new int[]{1, 1, 1}))
                     fail = "hidden=" + java.util.Arrays.toString(gpuHidden) + " want [1, 1, 1]";
             }
@@ -505,12 +506,14 @@ public class Runner {
                     fail = "hidden=" + java.util.Arrays.toString(gpuHidden) + " want [0, 1, 1, 0]";
             }
             case "offset9PlusSkip10" -> {
-                if (slowCount != 0 || fastVertices != 0) fail = "slow=" + slowCount + " fast=" + fastVertices + " want 0/0";
+                if (slowCount > 0 || fastVertices != 0) fail = "slow=" + slowCount + " fast=" + fastVertices + " want 0/0";
                 if (fail == null && !java.util.Arrays.equals(gpuHidden, new int[]{1, 1}))
                     fail = "hidden=" + java.util.Arrays.toString(gpuHidden) + " want [1, 1]";
             }
             case "offset9GpuOnly" -> {
-                if (slowCount != 8 || fastVertices != 8) fail = "slow=" + slowCount + " fast=" + fastVertices + " want 8/8";
+                // b1 offset9 -> b1 hidden, b2 (its child) hidden by
+                // propagation; only b0 renders.
+                if (slowCount != 4 || fastVertices != 4) fail = "slow=" + slowCount + " fast=" + fastVertices + " want 4/4";
                 if (fail == null && !java.util.Arrays.equals(gpuHidden, new int[]{0, 1, 1}))
                     fail = "hidden=" + java.util.Arrays.toString(gpuHidden) + " want [0, 1, 1]";
             }

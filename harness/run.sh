@@ -2,17 +2,32 @@
 # Differential harness: feed identical inputs to the shipped libysm-core.so
 # (golden) and the freshly built one, byte-compare all observable outputs.
 #
+# Two phases:
+#   drift:     golden vs new must be byte-identical (no semantics change).
+#              Cases touching offset9 / non-tree defence are semantic-only,
+#              they diverge from golden BY DESIGN (golden doesn't consume
+#              offset9; golden crashes on non-tree input).
+#   semantic:  new lib only, real assertions (exit 1 on mismatch).
+#
 # Usage: ./harness/run.sh <path-to-new-libysm-core.so> [case ...]
 set -u
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
-GOLDEN_SO="${GOLDEN_SO:-/home/brokestar/workspace/ModernYSM/common/src/main/resources/natives/linux-x64/libysm-core.so}"
+if [ -z "${GOLDEN_SO:-}" ]; then
+  for c in \
+    /home/brokestar/workspace/ModernYSM/src/main/resources/natives/linux-x64/libysm-core.so \
+    /home/brokestar/workspace/ModernYSM/common/src/main/resources/natives/linux-x64/libysm-core.so; do
+    [ -f "$c" ] && GOLDEN_SO="$c" && break
+  done
+fi
+GOLDEN_SO="${GOLDEN_SO:?set GOLDEN_SO=<shipped libysm-core.so>}"
 NEW_SO="${1:?usage: run.sh <new-libysm-core.so> [case...]}"
 shift || true
 CASES=("$@")
 if [ ${#CASES[@]} -eq 0 ]; then
-  CASES=(normal translucent glow partMask hiddenSubtree emptyMesh state zeroScale culled gpuMesh)
+  CASES=(normal translucent glow partMask hiddenSubtree emptyMesh state zeroScale culled gpuMultiQuad)
 fi
+SEMANTIC_CASES=(offset9Self offset9Root offset9Midtree offset9PlusSkip10 offset9GpuOnly nontreeBadParent nontreeCycle)
 
 BUILD="$HARNESS_DIR/build"
 mkdir -p "$BUILD/out"
@@ -39,7 +54,21 @@ for c in "${CASES[@]}"; do
   fi
 done
 
+sem_total=0; sem_pass=0; sem_failed=()
+for c in "${SEMANTIC_CASES[@]}"; do
+  sem_total=$((sem_total+1))
+  YSM_SEMANTIC=1 YSM_LIB="$NEW_SO" java -cp "$BUILD/classes" "Runner" "$c" "$BUILD/out/$c.semantic" 2>"$BUILD/out/$c.semantic.err"
+  if grep -q "semantic.result=PASS" "$BUILD/out/$c.semantic" 2>/dev/null; then
+    echo "SEMANTIC-PASS $c (golden diverges by design: offset9 unconsumed / non-tree crash)"; sem_pass=$((sem_pass+1))
+  else
+    echo "SEMANTIC-FAIL $c"; sem_failed+=("$c")
+    grep "semantic.result" "$BUILD/out/$c.semantic" 2>/dev/null | sed 's/^/    /'
+  fi
+done
+
 echo "----------------------------------------"
-echo "harness: $pass/$total passed"
-[ $fail -gt 0 ] && printf 'failed: %s\n' "${failed_cases[*]}"
-exit $fail
+echo "harness drift: $pass/$total passed; semantic: $sem_pass/$sem_total passed"
+rc=0
+[ $fail -gt 0 ] && { printf 'drift failed: %s\n' "${failed_cases[*]}"; rc=1; }
+[ $sem_pass -ne $sem_total ] && { printf 'semantic failed: %s\n' "${sem_failed[*]}"; rc=1; }
+exit $rc

@@ -12,15 +12,26 @@ import java.util.List;
 /**
  * Differential harness runner.
  *
- * Usage: java Runner <case> <outFile>
- * env:   YSM_LIB = absolute path of the libysm-core.so under test.
+ * Usage:   java Runner <case> <outFile>
+ *          YSM_LIB   = absolute path of the libysm-core.so under test.
+ *          YSM_SEMANTIC=1 -> semantic mode: real assertions against the
+ *                            patched behaviour (offset9 / non-tree fixes);
+ *                            exits 1 on mismatch. Golden diverges by design.
  *
- * Builds the model wire buffer exactly like GeoModel.buildNativeCache()
- * (4 + bones*25 + cubes*5 + quads*93 bytes; per quad: translucent byte,
- * 12 float positions, 8 float uvs, 3 float normal), drives the JNI surface
- * through both the submitVertices callback path (vertexConsumer = null) and
- * the nInitSIMD BufferBuilder direct-write path, plus the GPU mesh path, and
- * dumps every observable output as hex lines for byte-level diffing.
+ * TWO wire protocols, matching the two production Java writers:
+ *   SIMD wire  (GeoModel.buildNativeCache -> nInitModelCache):
+ *       4 + bones*25 + cubes*5 + quads*93 bytes; per quad: translucent byte,
+ *       12 float positions, 8 float uvs, 3 float normal.
+ *   GPU wire   (GpuMeshBuilder.serializeModel -> nBuildGpuMesh):
+ *       same minus the translucent byte = 92 bytes per quad.
+ *       Evidence: shipped .so GM_nBuildGpuMesh.asm quad advance = 0x5c (92B);
+ *       fed the 93B wire the shipped binary desyncs and crashes.
+ *
+ * All native-facing ByteBuffers MUST be allocateDirect: GetDirectBufferAddress
+ * returns null for heap buffers, which silently voids a case (handle=0
+ * early-return on both sides = vacuous green). Found 2026-09-17 when this
+ * harness was re-validated: its original 10/10 "green" had never executed a
+ * single native instruction (heap ByteBuffers).
  */
 public class Runner {
 
@@ -126,22 +137,94 @@ public class Runner {
                                 f(0f, 0f, .25f, 0f, .25f, .25f, 0f, .25f),
                                 f(0, 0, 1)))))));
             }
-            case "gpuMesh" -> {
-                // Same shape as "translucent": drives nBuildGpuMesh +
-                // nComputeBoneMatricesLocal (glow bone included).
+            case "gpuMultiQuad" -> {
+                // GPU-protocol drift case: multi-bone/multi-cube/multi-quad,
+                // pins the 92B quad stride byte-level (a 93B reader desyncs
+                // after the first quad).
                 bones.add(new Bone(-1, 1, true, 1, 2, 3, List.of(
                         new Cube(true, List.of(quad(false, true, 5f, 0f))),
-                        new Cube(true, List.of(quad(true, true, 5f, 0.25f))))));
+                        new Cube(true, List.of(quad(true, true, 5f, 0.25f))),
+                        new Cube(false, List.of(quad(false, false, 5.25f, 0.5f))))));
                 bones.add(new Bone(0, 2, false, 4, 2, 0, List.of(
-                        new Cube(false, List.of(quad(true, false, 6f, 0.5f))))));
+                        new Cube(false, List.of(quad(true, false, 6f, 0.5f))),
+                        new Cube(true, List.of(quad(false, true, 6.5f, 0.75f))))));
+                bones.add(new Bone(1, 2, false, 2, 1, 0, List.of(
+                        new Cube(true, List.of(quad(true, true, 7f, 0.1f))))));
+            }
+            // ---- semantic cases (offset9 fix; diverge from shipped by design) ----
+            case "offset9Self" -> {
+                // b1 hidden itself -> own quads culled, parent chain intact.
+                bones.add(new Bone(-1, 0, false, 0, 0, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5f, 0f))))));
+                bones.add(new Bone(0, 0, false, 4, 2, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5.5f, 0.5f))))));
+            }
+            case "offset9Root" -> {
+                // root hidden -> whole subtree culled (CPU visibleCache parity).
+                bones.add(new Bone(-1, 0, false, 0, 0, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5f, 0f))))));
+                bones.add(new Bone(0, 0, false, 4, 2, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5.5f, 0.5f))))));
+                bones.add(new Bone(1, 0, false, 8, 2, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 6f, 0.75f))))));
+            }
+            case "offset9Midtree" -> {
+                // b1 hidden: b0 + b3 (second child of root) visible,
+                // b1 + its child b2 culled.
+                bones.add(new Bone(-1, 0, false, 0, 0, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5f, 0f))))));
+                bones.add(new Bone(0, 0, false, 4, 2, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5.5f, 0.5f))))));
+                bones.add(new Bone(1, 0, false, 8, 2, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 6f, 0.75f))))));
+                bones.add(new Bone(0, 0, false, 2, 0, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 6.5f, 0.9f))))));
+            }
+            case "offset9PlusSkip10" -> {
+                // offset9 and offset10 both set on the root: single k-advance,
+                // no double-skip, whole subtree gone.
+                bones.add(new Bone(-1, 0, false, 0, 0, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5f, 0f))))));
+                bones.add(new Bone(0, 0, false, 4, 2, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5.5f, 0.5f))))));
+            }
+            case "offset9GpuOnly" -> {
+                // GPU leg: offset9 on b1; self + inherited isHidden asserted.
+                bones.add(new Bone(-1, 0, false, 0, 0, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5f, 0f))))));
+                bones.add(new Bone(0, 0, false, 4, 2, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5.5f, 0.5f))))));
+                bones.add(new Bone(1, 0, false, 8, 2, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 6f, 0.75f))))));
+            }
+            // ---- semantic cases (non-tree defense; shipped crashes) ----
+            case "nontreeBadParent" -> {
+                // parentIdx 42 out of range: shipped OOB-writes children[42],
+                // patched clamps to root.
+                bones.add(new Bone(-1, 0, false, 0, 0, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5f, 0f))))));
+                bones.add(new Bone(42, 0, false, 4, 2, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5.5f, 0.5f))))));
+            }
+            case "nontreeCycle" -> {
+                // 2-cycle: no root -> shipped evalOrder empty -> render loop
+                // reads evalOrder[k] OOB; patched appends leftovers.
+                bones.add(new Bone(1, 0, false, 0, 0, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5f, 0f))))));
+                bones.add(new Bone(0, 0, false, 4, 2, 0,
+                        List.of(new Cube(true, List.of(quad(false, true, 5.5f, 0.5f))))));
             }
             default -> throw new IllegalArgumentException("unknown case " + testCase);
         }
         return bones;
     }
 
+    private static final java.util.Set<String> OFFSET9_CASES = java.util.Set.of(
+            "offset9Self", "offset9Root", "offset9Midtree", "offset9PlusSkip10", "offset9GpuOnly");
+
     private static float[] animFor(String testCase, int boneCount) {
         float[] anim = new float[boneCount * 12];
+        boolean isOffset9 = OFFSET9_CASES.contains(testCase);
         for (int b = 0; b < boneCount; ++b) {
             int o = b * 12;
             anim[o + 0] = 0.3f + 0.1f * b;   // rx
@@ -153,14 +236,26 @@ public class Runner {
             anim[o + 6] = 1.1f;              // sx
             anim[o + 7] = 0.9f;              // sy
             anim[o + 8] = 1.0f;              // sz
-            anim[o + 9] = 0f;                // unk9
-            anim[o + 10] = "hiddenSubtree".equals(testCase) && b == 1 ? 1f : 0f; // skip flag
+            anim[o + 9] = 0f;                // offset9 HIDDEN
+            anim[o + 10] = "hiddenSubtree".equals(testCase) && b == 1 ? 1f : 0f; // offset10 skip flag
             anim[o + 11] = "state".equals(testCase) ? 1f : 0f;                   // state sentinel
         }
         if ("zeroScale".equals(testCase)) {
             anim[12 + 6] = 0f;
             anim[12 + 7] = 0f;
             anim[12 + 8] = 0f;
+        }
+        if (isOffset9) {
+            switch (testCase) {
+                case "offset9Self" -> anim[12 + 9] = 1f;
+                case "offset9Root" -> anim[9] = 1f;
+                case "offset9Midtree" -> anim[12 + 9] = 1f;
+                case "offset9PlusSkip10" -> {
+                    anim[9] = 1f;
+                    anim[10] = 1f; // offset10 on the same root bone
+                }
+                case "offset9GpuOnly" -> anim[12 + 9] = 1f;
+            }
         }
         return anim;
     }
@@ -186,16 +281,27 @@ public class Runner {
         return m;
     }
 
-    // ----- wire buffer (mirrors GeoModel.buildNativeCache) ------------------
+    // ----- wire buffers -------------------------------------------------------
 
-    private static ByteBuffer wire(List<Bone> bones) {
+    /** SIMD wire: mirrors GeoModel.buildNativeCache() — translucent byte per quad (93B). */
+    private static ByteBuffer simdWire(List<Bone> bones) {
+        return wire(bones, true);
+    }
+
+    /** GPU wire: mirrors GpuMeshBuilder.serializeModel() — no translucent byte (92B). */
+    private static ByteBuffer gpuWire(List<Bone> bones) {
+        return wire(bones, false);
+    }
+
+    private static ByteBuffer wire(List<Bone> bones, boolean translucentByte) {
         int quads = 0;
         for (Bone b : bones) for (Cube c : b.cubes()) quads += c.quads().size();
-        int size = 4 + bones.size() * 25 + quads * 0; // cubes counted below
         int cubes = 0;
         for (Bone b : bones) cubes += b.cubes().size();
-        size = 4 + bones.size() * 25 + cubes * 5 + quads * 93;
-        ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.nativeOrder());
+        int quadSize = translucentByte ? 93 : 92;
+        int size = 4 + bones.size() * 25 + cubes * 5 + quads * quadSize;
+        // MUST be direct: GetDirectBufferAddress returns null for heap buffers.
+        ByteBuffer buf = ByteBuffer.allocateDirect(size).order(ByteOrder.nativeOrder());
         buf.putInt(bones.size());
         for (Bone b : bones) {
             buf.putInt(b.parent());
@@ -209,7 +315,7 @@ public class Runner {
                 buf.put((byte) (c.cullable() ? 1 : 0));
                 buf.putInt(c.quads().size());
                 for (Quad q : c.quads()) {
-                    buf.put((byte) (q.translucent() ? 1 : 0));
+                    if (translucentByte) buf.put((byte) (q.translucent() ? 1 : 0));
                     for (float p : q.positions()) buf.putFloat(p);
                     for (float u : q.uvs()) buf.putFloat(u);
                     for (float n : q.normal()) buf.putFloat(n);
@@ -245,11 +351,22 @@ public class Runner {
         return sb.toString();
     }
 
+    /** isHidden flag of BoneDataOut (144B stride: transform 64 + normal 64 + light 4 + isHidden 4). */
+    private static int isHiddenAt(ByteBuffer outBone, int boneIdx) {
+        return outBone.getInt(boneIdx * 144 + 132);
+    }
+
     // ----- driver -------------------------------------------------------------
+
+    // captured for semantic assertions
+    static int slowCount, fastVertices, maskCount;
+    static int[] gpuHidden;
+    static boolean cacheAlive, gpuAlive;
 
     public static void main(String[] args) throws Exception {
         String testCase = args[0];
         String outPath = args[1];
+        boolean semantic = "1".equals(System.getenv("YSM_SEMANTIC"));
         PrintWriter out = new PrintWriter(outPath, "UTF-8");
 
         List<Bone> bones = bonesFor(testCase);
@@ -260,10 +377,14 @@ public class Runner {
         GeoModel.nInitSIMD(MockBufferBuilder.class, "buffer", "vertices", "nextElementByte",
                 "ensureCapacity", "mode", MockVertexFormat.Mode.class);
 
-        long handle = GeoModel.nInitModelCache(wire(bones));
-        out.println("handle!=" + (handle != 0));
+        long handle = GeoModel.nInitModelCache(simdWire(bones));
+        cacheAlive = handle != 0;
+        out.println("handle!=" + cacheAlive);
+        out.flush();
         if (handle == 0) {
+            if (semantic) out.println("semantic.result=FAIL (cache handle=0)");
             out.close();
+            if (semantic) System.exit(1);
             return;
         }
 
@@ -276,11 +397,12 @@ public class Runner {
         NativeModelRenderer.callCount = 0;
         GeoModel.nComputeModelVertices(handle, null, mats, anim, state,
                 0, light, overlay, 0.25f, 0.5f, 0.75f, 1.0f);
+        slowCount = NativeModelRenderer.lastVertexCount;
         out.println("slow.calls=" + NativeModelRenderer.callCount);
-        out.println("slow.count=" + NativeModelRenderer.lastVertexCount);
-        if (NativeModelRenderer.lastFBuf != null && NativeModelRenderer.lastVertexCount > 0) {
-            int fLen = NativeModelRenderer.lastVertexCount * 12 * 4;
-            int iLen = NativeModelRenderer.lastVertexCount * 2 * 4;
+        out.println("slow.count=" + slowCount);
+        if (NativeModelRenderer.lastFBuf != null && slowCount > 0) {
+            int fLen = slowCount * 12 * 4;
+            int iLen = slowCount * 2 * 4;
             out.println("slow.f=" + hex(NativeModelRenderer.lastFBuf, fLen));
             out.println("slow.i=" + hex(NativeModelRenderer.lastIBuf, iLen));
         }
@@ -293,28 +415,33 @@ public class Runner {
         java.util.Arrays.fill(state, 0f);
         GeoModel.nComputeModelVertices(handle, builder, mats, anim, state,
                 0, light, overlay, 0.25f, 0.5f, 0.75f, 1.0f);
+        fastVertices = builder.vertices;
         out.println("fast.ensureCalls=" + builder.ensureCapacityCalls);
         out.println("fast.ensureArg=" + builder.lastEnsureCapacityArg);
         out.println("fast.written=" + builder.nextElementByte);
         out.println("fast.buffer=" + hex(builder.buffer, Math.max(0, builder.nextElementByte)));
-        out.println("fast.vertices=" + builder.vertices);
+        out.println("fast.vertices=" + fastVertices);
 
         // --- partMask pass (slow only; mask=2) ---
         NativeModelRenderer.callCount = 0;
         GeoModel.nComputeModelVertices(handle, null, mats, anim, state,
                 2, light, overlay, 1f, 1f, 1f, 1f);
+        maskCount = NativeModelRenderer.lastVertexCount;
         out.println("mask.calls=" + NativeModelRenderer.callCount);
-        out.println("mask.count=" + NativeModelRenderer.lastVertexCount);
-        if (NativeModelRenderer.lastVertexCount > 0) {
+        out.println("mask.count=" + maskCount);
+        if (maskCount > 0) {
             out.println("mask.f=" + hex(NativeModelRenderer.lastFBuf,
-                    NativeModelRenderer.lastVertexCount * 12 * 4));
+                    maskCount * 12 * 4));
         }
+        out.flush();
 
-        // --- GPU mesh path ---
+        // --- GPU mesh path (92B GPU wire, mirrors GpuMeshBuilder.serializeModel) ---
         int[] meta = new int[9];
-        long mesh = GeoModel.nBuildGpuMesh(wire(bones), meta);
-        out.println("gpu.handle!=" + (mesh != 0));
+        long mesh = GeoModel.nBuildGpuMesh(gpuWire(bones), meta);
+        gpuAlive = mesh != 0;
+        out.println("gpu.handle!=" + gpuAlive);
         out.println("gpu.meta=" + hex(meta, 9));
+        out.flush();
         if (mesh != 0) {
             ByteBuffer vb = GeoModel.nGetGpuMeshVertexBuffer(mesh);
             ByteBuffer ib = GeoModel.nGetGpuMeshIndexBuffer(mesh);
@@ -327,12 +454,80 @@ public class Runner {
                     .order(ByteOrder.nativeOrder());
             GeoModel.nComputeBoneMatricesLocal(mesh, anim, light, outBone);
             out.println("gpu.boneOut=" + hex(outBone, boneCount * 144));
+            // world-mode matrices too (nComputeBoneMatrices: rootPose/rootNormal arrays)
+            float[] pose = new float[16], normal = new float[16];
+            System.arraycopy(mats, 0, pose, 0, 16);
+            System.arraycopy(mats, 16, normal, 0, 16);
+            GeoModel.nComputeBoneMatrices(mesh, pose, normal, anim, light, outBone);
+            out.println("gpu.boneOutWorld=" + hex(outBone, boneCount * 144));
+            gpuHidden = new int[boneCount];
+            for (int i = 0; i < boneCount; i++) gpuHidden[i] = isHiddenAt(outBone, i);
+            out.println("gpu.isHidden=" + java.util.Arrays.toString(gpuHidden));
 
             GeoModel.nReleaseGpuMeshScratch(mesh);
             GeoModel.nFreeGpuMesh(mesh);
         }
+        out.flush();
 
         GeoModel.nDestroyModelCache(handle);
+        out.flush();
+
+        if (semantic) {
+            int rc = semanticCheck(testCase, boneCount, out);
+            out.close();
+            System.exit(rc);
+        }
         out.close();
+    }
+
+    /**
+     * Real assertions (exit 1 on mismatch) for the offset9 / non-tree fixes.
+     * Expected values derived from CPU-path parity (calculateBoneMatrix):
+     * offset9!=0 -> bone invisible, subtree invisible; non-tree inputs must
+     * not crash and must render every bone.
+     */
+    private static int semanticCheck(String testCase, int boneCount, PrintWriter out) {
+        String fail = null;
+        switch (testCase) {
+            case "offset9Self" -> {
+                if (slowCount != 4 || fastVertices != 4) fail = "slow=" + slowCount + " fast=" + fastVertices + " want 4/4";
+                if (fail == null && !java.util.Arrays.equals(gpuHidden, new int[]{0, 1}))
+                    fail = "hidden=" + java.util.Arrays.toString(gpuHidden) + " want [0, 1]";
+            }
+            case "offset9Root" -> {
+                if (slowCount != 0 || fastVertices != 0) fail = "slow=" + slowCount + " fast=" + fastVertices + " want 0/0";
+                if (fail == null && !java.util.Arrays.equals(gpuHidden, new int[]{1, 1, 1}))
+                    fail = "hidden=" + java.util.Arrays.toString(gpuHidden) + " want [1, 1, 1]";
+            }
+            case "offset9Midtree" -> {
+                if (slowCount != 8 || fastVertices != 8) fail = "slow=" + slowCount + " fast=" + fastVertices + " want 8/8";
+                if (fail == null && !java.util.Arrays.equals(gpuHidden, new int[]{0, 1, 1, 0}))
+                    fail = "hidden=" + java.util.Arrays.toString(gpuHidden) + " want [0, 1, 1, 0]";
+            }
+            case "offset9PlusSkip10" -> {
+                if (slowCount != 0 || fastVertices != 0) fail = "slow=" + slowCount + " fast=" + fastVertices + " want 0/0";
+                if (fail == null && !java.util.Arrays.equals(gpuHidden, new int[]{1, 1}))
+                    fail = "hidden=" + java.util.Arrays.toString(gpuHidden) + " want [1, 1]";
+            }
+            case "offset9GpuOnly" -> {
+                if (slowCount != 8 || fastVertices != 8) fail = "slow=" + slowCount + " fast=" + fastVertices + " want 8/8";
+                if (fail == null && !java.util.Arrays.equals(gpuHidden, new int[]{0, 1, 1}))
+                    fail = "hidden=" + java.util.Arrays.toString(gpuHidden) + " want [0, 1, 1]";
+            }
+            case "nontreeBadParent", "nontreeCycle" -> {
+                if (!cacheAlive) fail = "cache handle=0";
+                if (fail == null && !gpuAlive) fail = "gpu handle=0";
+                if (fail == null && (slowCount != 8 || fastVertices != 8))
+                    fail = "slow=" + slowCount + " fast=" + fastVertices + " want 8/8";
+            }
+            default -> {
+                out.println("semantic.case=" + testCase);
+                out.println("semantic.result=SKIP (no assertions)");
+                return 0;
+            }
+        }
+        out.println("semantic.case=" + testCase);
+        out.println("semantic.result=" + (fail == null ? "PASS" : "FAIL " + fail));
+        return fail == null ? 0 : 1;
     }
 }

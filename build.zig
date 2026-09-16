@@ -180,9 +180,15 @@ fn buildAndroid(
     base_flags: []const []const u8,
 ) !void {
     const host = ndkHostTag();
+    // NDK ships both `aarch64-linux-android21-clang++` (sh script) and a
+    // `.cmd` batch twin; only Windows hosts execute the .cmd one.
+    const wrapper_suffix = switch (@import("builtin").os.tag) {
+        .windows => ".cmd",
+        else => "",
+    };
     const clang_exe = b.fmt(
-        "{s}/toolchains/llvm/prebuilt/{s}/bin/aarch64-linux-android{d}-clang++.cmd",
-        .{ ndk_root, host, android_api },
+        "{s}/toolchains/llvm/prebuilt/{s}/bin/aarch64-linux-android{d}-clang++{s}",
+        .{ ndk_root, host, android_api, wrapper_suffix },
     );
 
     const out_name = "libysm-core.so";

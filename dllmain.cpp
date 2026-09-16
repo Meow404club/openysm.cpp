@@ -647,6 +647,7 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         const FastQuad *fq;
         const PrecomputedBoneMats *pMat;
         bool cullable;
+        bool translucent;
     };
     static thread_local std::vector<Staged> staged;
     staged.clear();
@@ -662,9 +663,11 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         float animRx = animData[pOffset + 0], animRy = animData[pOffset + 1], animRz = animData[pOffset + 2];
         float animTx = animData[pOffset + 3], animTy = animData[pOffset + 4], animTz = animData[pOffset + 5];
         float animSx = animData[pOffset + 6], animSy = animData[pOffset + 7], animSz = animData[pOffset + 8];
-        // [D] skip flag from animData[+10]; the shipped binary has NO
-        // scale==0 early-out (upstream's was removed).
+        // Skip flag from animData[+10]. The shipped binary ALSO skips the
+        // bone itself and its subtree when any scale slot is 0 (probed:
+        // mid-chain scale0 -> self+child quads gone with culling disabled).
         float skipChildrenFlag = animData[pOffset + 10];
+        const bool zeroScale = (animSx == 0.0f || animSy == 0.0f || animSz == 0.0f);
 
         float px = bone.pivotX * 0.0625f, py = bone.pivotY * 0.0625f, pz = bone.pivotZ * 0.0625f;
         float dx = px - animTx * 0.0625f;
@@ -762,7 +765,7 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
                 }
             }
             if (outside) {
-                if (skipChildrenFlag != 0.0f) {
+                if (skipChildrenFlag != 0.0f || zeroScale) {
                     k += bone.subtreeCount + 1;
                 } else {
                     k++;
@@ -771,47 +774,52 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
             }
         }
 
-        model->visibleBones.push_back(bIdx);
+        // Shipped binary: a zero-scale bone emits no quads and skips its
+        // subtree (mirrors the CPU path's visibleCache propagation).
+        if (!zeroScale) {
+            model->visibleBones.push_back(bIdx);
+        }
 
-        if (skipChildrenFlag != 0.0f) {
+        if (skipChildrenFlag != 0.0f || zeroScale) {
             k += bone.subtreeCount + 1;
         } else {
             k++;
         }
     }
 
-    // Stage quads of visible bones. Bucket iteration order (opaque cullable,
-    // opaque non-cullable, translucent cullable, translucent non-cullable)
-    // preserves per-bucket wire order.
+    // Stage quads of visible bones. The shipped binary consumes GLOBAL
+    // buckets across all visible bones in this order (decoded from 4-bucket
+    // probe + multi-bone case): nonCullable, cullable, nonCullableTranslucent,
+    // cullableTranslucent; wire order within a bucket, bone order across bones.
     {
-        auto collectBone = [&](int bIdx) {
-            const NativeBone &bone = model->bones[bIdx];
-            if (bone.quadCount == 0) return;
-            if (renderPartMask != 0 && bone.partMask != renderPartMask && bone.partMask != 3) return;
-            for (const FastQuad &fq: model->buckets.cullable)
-                if (fq.boneIdx == bIdx)
-                    staged.push_back({&fq, &model->cachePrecompMats[bIdx], true});
-            for (const FastQuad &fq: model->buckets.nonCullable)
-                if (fq.boneIdx == bIdx)
-                    staged.push_back({&fq, &model->cachePrecompMats[bIdx], false});
-            for (const FastQuad &fq: model->buckets.cullableTranslucent)
-                if (fq.boneIdx == bIdx)
-                    staged.push_back({&fq, &model->cachePrecompMats[bIdx], true});
-            for (const FastQuad &fq: model->buckets.nonCullableTranslucent)
-                if (fq.boneIdx == bIdx)
-                    staged.push_back({&fq, &model->cachePrecompMats[bIdx], false});
+        auto collectBucket = [&](const std::vector<FastQuad> &bucket, bool cullable, bool translucent) {
+            for (int bIdx: model->visibleBones) {
+                const NativeBone &bone = model->bones[bIdx];
+                if (bone.quadCount == 0) continue;
+                if (renderPartMask != 0 && bone.partMask != renderPartMask && bone.partMask != 3)
+                    continue;
+                for (const FastQuad &fq: bucket)
+                    if (fq.boneIdx == bIdx)
+                        staged.push_back({&fq, &model->cachePrecompMats[bIdx], cullable, translucent});
+            }
         };
-        for (int bIdx: model->visibleBones) collectBone(bIdx);
+        collectBucket(model->buckets.nonCullable, false, false);
+        collectBucket(model->buckets.cullable, true, false);
+        collectBucket(model->buckets.nonCullableTranslucent, false, true);
+        collectBucket(model->buckets.cullableTranslucent, true, true);
     }
 
     int actualQuads = 0;
 
     static thread_local std::vector<float> fData;
     static thread_local std::vector<int> iData;
+    static thread_local std::vector<uint64_t> quadOvlLight; // per output quad
     fData.clear();
     iData.clear();
+    quadOvlLight.clear();
     fData.reserve(staged.size() * 48 + 16);
     iData.reserve(staged.size() * 8);
+    quadOvlLight.reserve(staged.size());
 
     __m128 proj00 = _mm_set1_ps(projMat.m[0]), proj01 = _mm_set1_ps(projMat.m[4]),
            proj02 = _mm_set1_ps(projMat.m[8]), proj03 = _mm_set1_ps(projMat.m[12]);
@@ -888,10 +896,21 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
             fp[10] = fn[1];
             fp[11] = fn[2];
 
-            std::memcpy(iData.data() + iData.size(), &ovl_light64, sizeof(uint64_t));
-            iData.resize(iData.size() + 2);
+            // Resize FIRST, then write: memcpy into data()+size() followed by
+            // resize() let the zero-init overwrite the payload (slow-path
+            // overlay/light arrived all-zero — drift vs shipped caught by the
+            // reworked harness).
+            // Shipped-binary quirk, replicated for byte parity: on translucent
+            // quads the FIRST vertex's overlay slot is 0 (light intact);
+            // observed only in the slow path, the fast path writes both.
+            const uint64_t ovl_light =
+                (st.translucent && v == 0) ? (ovl_light64 & 0xFFFFFFFF00000000ULL) : ovl_light64;
+            const size_t iBase = iData.size();
+            iData.resize(iBase + 2);
+            std::memcpy(iData.data() + iBase, &ovl_light, sizeof(uint64_t));
         }
 
+        quadOvlLight.push_back(ovl_light64);
         actualQuads++;
     }
 
@@ -918,7 +937,10 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
 
     if (builderAvailable && builder) {
         // [A] Direct-write fast path (asm 189c9-18a54, 19e53-19e9a):
-        //   ensureCapacity(quads*16)                       (189d7-189ea)
+        //   ensureCapacity(staged quads * 144 bytes)       (pre-det-cull count:
+        //                                                   shipped-binary probe
+        //                                                   6 staged -> 864
+        //                                                   while 5 emitted)
         //   vertices     = GetIntField(builder)            (189fa, 0x320)
         //   nextElementByte = GetIntField(builder)         (18a1e, 0x320)
         //   buffer       = GetObjectField + GetDirectBufferAddress
@@ -926,7 +948,7 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         //   write quads*144 bytes at [addr + nextElementByte] (4 x 36B records)
         //   SetIntField(vertices, old + quads*4)           (19e56-19e76, 0x368)
         //   SetIntField(nextElementByte, old + quads*144)  (19e7c-19e9a, 0x368)
-        env->CallVoidMethod(builder, g_ensureCapacityMethodID, (jint) (actualQuads * 16));
+        env->CallVoidMethod(builder, g_ensureCapacityMethodID, (jint) (staged.size() * 144));
         if (env->ExceptionCheck()) return;
 
         jint vertices = env->GetIntField(builder, g_verticesFieldID);
@@ -939,14 +961,30 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
             return;
         }
 
-        // Per-vertex 36-byte record: pos(3f) rgba(4f) uv(2f) = 9 floats.
+        // Per-vertex 36-byte NEW_ENTITY record, byte-decoded from the shipped
+        // binary's fast-path output (harness fast.buffer dumps):
+        //   pos 3xf32 | color 4xu8 = (u8)(c*255) trunc | uv 2xf32
+        //   overlay 2xs16 + light 2xs16 (raw ovl_light64 split)
+        //   normal 3xs8 = (s8)(n*127) trunc | pad 0x00
         uint8_t *out = (uint8_t *) addr + nextElementByte;
         size_t cursor = 0;
         for (int q = 0; q < actualQuads; ++q) {
             const float *quad = fData.data() + (size_t) q * 48;
+            const uint64_t ovl = quadOvlLight[q];
             for (int v = 0; v < 4; ++v) {
                 const float *src = quad + v * 12;
-                std::memcpy(out + cursor, src, 9 * sizeof(float));
+                uint8_t *o = out + cursor;
+                std::memcpy(o, src, 3 * sizeof(float));
+                o[12] = (uint8_t) (int) (src[3] * 255.0f);
+                o[13] = (uint8_t) (int) (src[4] * 255.0f);
+                o[14] = (uint8_t) (int) (src[5] * 255.0f);
+                o[15] = (uint8_t) (int) (src[6] * 255.0f);
+                std::memcpy(o + 16, src + 7, 2 * sizeof(float));
+                std::memcpy(o + 24, &ovl, sizeof(uint64_t));
+                o[32] = (uint8_t) (int8_t) (src[9] * 127.0f);
+                o[33] = (uint8_t) (int8_t) (src[10] * 127.0f);
+                o[34] = (uint8_t) (int8_t) (src[11] * 127.0f);
+                o[35] = 0;
                 cursor += 36;
             }
         }
@@ -1033,9 +1071,11 @@ JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_buil
             for (int q = 0; q < qc; ++q) {
                 uint32_t vOff = static_cast<uint32_t>(tmpVerts.size());
 
-                // [C] translucent byte: consumed to keep the wire cursor in
-                // sync with GeoModel.buildNativeCache().
-                (void) readByte();
+                // GPU wire has NO translucent byte: the quad stride is 92
+                // bytes (12 pos + 8 uv + 3 normal floats). Evidence: shipped
+                // binary GM_nBuildGpuMesh.asm quad advance = 0x5c; feeding a
+                // 93B wire desyncs and crashes it. Writer counterpart =
+                // GpuMeshBuilder.serializeModel (4+25B+5C+92Q capacity).
 
                 float vx[4], vy[4], vz[4], uu[4], vv[4];
                 for (int v = 0; v < 4; ++v) {

@@ -1,6 +1,7 @@
 import com.elfmcys.yesstevemodel.geckolib3.geo.NativeModelRenderer;
 import com.elfmcys.yesstevemodel.geckolib3.geo.render.built.GeoModel;
 import mock.MockBufferBuilder;
+import mock.MockStagingBufferBuilder;
 import mock.MockVertexFormat;
 
 import java.io.PrintWriter;
@@ -63,9 +64,10 @@ public class Runner {
     private static List<Bone> bonesFor(String testCase) {
         List<Bone> bones = new ArrayList<>();
         switch (testCase) {
-            case "normal" -> {
+            case "normal", "stagingFast" -> {
                 // root + child, cullable opaque quads, no translucency,
-                // no skip flags, no state sentinel.
+                // no skip flags, no state sentinel. stagingFast reuses the
+                // same mesh to assert byte-parity between the two surfaces.
                 bones.add(new Bone(-1, 0, false, 0, 0, 0,
                         List.of(new Cube(true, List.of(quad(false, true, 5f, 0f))))));
                 bones.add(new Bone(0, 0, false, 4, 2, 0,
@@ -339,6 +341,14 @@ public class Runner {
         return sb.toString();
     }
 
+    private static String hex(byte[] bytes, int len) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < Math.min(len, bytes.length); i++) {
+            sb.append(String.format("%02x", bytes[i]));
+        }
+        return sb.toString();
+    }
+
     private static String hex(int[] arr, int len) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < len; i++) sb.append(String.format("%08x", arr[i]));
@@ -362,6 +372,10 @@ public class Runner {
     static int slowCount, fastVertices, maskCount;
     static int[] gpuHidden;
     static boolean cacheAlive, gpuAlive;
+
+    // stagingFast (26.2 field-face) semantic assertions
+    static int legacyFastVertices, stagingVertices, stagingReserveCalls, stagingReserveArg;
+    static byte[] legacyFastBytes, stagingBytes;
 
     public static void main(String[] args) throws Exception {
         String testCase = args[0];
@@ -421,6 +435,36 @@ public class Runner {
         out.println("fast.written=" + builder.nextElementByte);
         out.println("fast.buffer=" + hex(builder.buffer, Math.max(0, builder.nextElementByte)));
         out.println("fast.vertices=" + fastVertices);
+
+        // --- 26.x staging surface (semantic-only; "stagingFast") ---
+        // Re-arm nInitSIMD against the 26.2 BufferBuilder field face:
+        // nextElementByte / ensureCapacity / mode probes MISS (fields gone in
+        // 26.2), the buffer probe falls through to the ByteBufferBuilder
+        // descriptor (mock shadows that FQN), reserve resolves off the live
+        // buffer object. The staging payload must be byte-identical to the
+        // legacy payload above (same 36B NEW_ENTITY records).
+        if ("stagingFast".equals(testCase)) {
+            GeoModel.nInitSIMD(MockStagingBufferBuilder.class, "buffer", "vertices",
+                    "nextElementByte", "ensureCapacity", "mode", MockVertexFormat.Mode.class);
+            MockStagingBufferBuilder staging = new MockStagingBufferBuilder(4096);
+            java.util.Arrays.fill(state, 0f);
+            GeoModel.nComputeModelVertices(handle, staging, mats, anim, state,
+                    0, light, overlay, 0.25f, 0.5f, 0.75f, 1.0f);
+            stagingVertices = staging.vertices;
+            stagingReserveCalls = staging.buffer.reserveCalls;
+            stagingReserveArg = staging.buffer.lastReserveArg;
+            stagingBytes = staging.buffer.writtenBytes();
+            legacyFastVertices = fastVertices;
+            legacyFastBytes = new byte[Math.max(0, builder.nextElementByte)];
+            for (int i = 0; i < legacyFastBytes.length; i++) {
+                legacyFastBytes[i] = builder.buffer.get(i);
+            }
+            out.println("staging.vertices=" + stagingVertices);
+            out.println("staging.reserveCalls=" + stagingReserveCalls);
+            out.println("staging.reserveArg=" + stagingReserveArg);
+            out.println("staging.written=" + stagingBytes.length);
+            out.println("staging.buffer=" + hex(stagingBytes, stagingBytes.length));
+        }
 
         // --- partMask pass (slow only; mask=2) ---
         NativeModelRenderer.callCount = 0;
@@ -522,6 +566,21 @@ public class Runner {
                 if (fail == null && !gpuAlive) fail = "gpu handle=0";
                 if (fail == null && (slowCount != 8 || fastVertices != 8))
                     fail = "slow=" + slowCount + " fast=" + fastVertices + " want 8/8";
+            }
+            case "stagingFast" -> {
+                // 26.2/26.3 staging surface: the fast write must land through
+                // ByteBufferBuilder.reserve with the EXACT post-cull payload,
+                // byte-identical to the legacy surface's output.
+                if (!cacheAlive) fail = "cache handle=0";
+                if (fail == null && stagingVertices != legacyFastVertices)
+                    fail = "staging.vertices=" + stagingVertices + " legacy=" + legacyFastVertices;
+                if (fail == null && stagingReserveCalls != 1)
+                    fail = "reserveCalls=" + stagingReserveCalls + " want 1";
+                if (fail == null && stagingReserveArg != stagingBytes.length)
+                    fail = "reserveArg=" + stagingReserveArg + " != written=" + stagingBytes.length
+                            + " (reserve must consume the exact payload)";
+                if (fail == null && !java.util.Arrays.equals(stagingBytes, legacyFastBytes))
+                    fail = "staging payload != legacy payload";
             }
             default -> {
                 out.println("semantic.case=" + testCase);

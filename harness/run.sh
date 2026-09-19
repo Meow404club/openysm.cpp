@@ -27,7 +27,7 @@ CASES=("$@")
 if [ ${#CASES[@]} -eq 0 ]; then
   CASES=(normal translucent glow partMask hiddenSubtree emptyMesh state zeroScale culled gpuMultiQuad)
 fi
-SEMANTIC_CASES=(offset9Self offset9Root offset9Midtree offset9PlusSkip10 offset9GpuOnly nontreeBadParent nontreeCycle)
+SEMANTIC_CASES=(offset9Self offset9Root offset9Midtree offset9PlusSkip10 offset9GpuOnly nontreeBadParent nontreeCycle stagingFast)
 
 BUILD="$HARNESS_DIR/build"
 mkdir -p "$BUILD/out"

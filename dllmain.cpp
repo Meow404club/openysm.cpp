@@ -90,6 +90,25 @@ static jfieldID g_modeFieldID = nullptr;               // bss 0x44a28 (cached;
                                                        // never read back by the
                                                        // shipped binary)
 
+// [A2] 26.2/26.3 staging surface (native-262). 26.2 rewrote BufferBuilder's
+// field face: `buffer` became a ByteBufferBuilder (raw native-memory staging),
+// `nextElementByte`/`ensureCapacity` are gone (the write position now lives
+// inside ByteBufferBuilder.reserve), `mode` became primitiveTopology. neoform
+// 26.3 sources diff field-identical, so one staging path covers both. The
+// mapping NAMES still arrive via the BufferBuilderMixin annotations; the
+// SURFACE is probed at runtime instead of assumed:
+//   legacy : buffer Ljava/nio/ByteBuffer; + nextElementByte I + ensureCapacity (I)V
+//   staging: buffer Lcom/mojang/blaze3d/vertex/ByteBufferBuilder; + vertices I
+//            + ByteBufferBuilder.reserve(I)J (resolved lazily off the live
+//            buffer object — no class name hardcode beyond the field probe)
+static bool g_stagingBufferField = false;              // buffer probe hit the
+                                                       // ByteBufferBuilder desc
+static jfieldID g_vertexSizeFieldID = nullptr;         // "vertexSize" I — 36B
+                                                       // record guard (staging
+                                                       // only; optional)
+static jmethodID g_reserveMethodID = nullptr;          // ByteBufferBuilder.reserve(I)J
+static bool g_reserveProbeDead = false;                // lookup failed; stop retrying
+
 struct FastQuad {
     int boneIdx;
     bool cullable;
@@ -346,20 +365,65 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         if (g_BufferBuilderClass) env->DeleteGlobalRef(g_BufferBuilderClass);
         g_BufferBuilderClass = (jclass) env->NewGlobalRef(bufferBuilderClass);
 
+        // [A2] Per-field runtime probes, each exception-cleared on miss. The
+        // legacy surface arms only when nextElementByte + ensureCapacity both
+        // resolve; the staging surface arms when the buffer field probe falls
+        // through to the ByteBufferBuilder descriptor (26.2/26.3). mode is a
+        // pure init gate (never read back by the fast paths) so its miss is
+        // always tolerated — this is what makes 26.x init succeed at all.
         g_bufferFieldID =
             env->GetFieldID(g_BufferBuilderClass, bufferNameC, "Ljava/nio/ByteBuffer;");
-        if (env->ExceptionCheck()) goto cleanup;
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            g_bufferFieldID = env->GetFieldID(
+                g_BufferBuilderClass, bufferNameC,
+                "Lcom/mojang/blaze3d/vertex/ByteBufferBuilder;");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                g_bufferFieldID = nullptr;
+                g_stagingBufferField = false;
+            } else {
+                g_stagingBufferField = true;
+            }
+        } else {
+            g_stagingBufferField = false;
+        }
         g_verticesFieldID = env->GetFieldID(g_BufferBuilderClass, verticesNameC, "I");
-        if (env->ExceptionCheck()) goto cleanup;
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            g_verticesFieldID = nullptr;
+        }
         g_nextElementByteFieldID =
             env->GetFieldID(g_BufferBuilderClass, nextElementByteNameC, "I");
-        if (env->ExceptionCheck()) goto cleanup;
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            g_nextElementByteFieldID = nullptr;
+        }
         g_modeFieldID =
             env->GetFieldID(g_BufferBuilderClass, modeNameC, modeDescriptor.c_str());
-        if (env->ExceptionCheck()) goto cleanup;
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            g_modeFieldID = nullptr;
+        }
         g_ensureCapacityMethodID =
             env->GetMethodID(g_BufferBuilderClass, ensureCapacityNameC, "(I)V");
-        if (env->ExceptionCheck()) goto cleanup;
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            g_ensureCapacityMethodID = nullptr;
+        }
+        // Staging write guard: the fast path emits fixed 36-byte NEW_ENTITY
+        // records, so it must only engage when the live builder strides 36
+        // bytes (DefaultVertexFormat.ENTITY). Optional — the legacy surface
+        // has no such field and the probe miss is tolerated.
+        g_vertexSizeFieldID = env->GetFieldID(g_BufferBuilderClass, "vertexSize", "I");
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            g_vertexSizeFieldID = nullptr;
+        }
+
+        // Reset lazy staging state on re-init.
+        g_reserveMethodID = nullptr;
+        g_reserveProbeDead = false;
 
         // Optional Sodium integration; the shipped binary clears the pending
         // exception when the class is missing (asm 1c1e3-1c254).
@@ -377,13 +441,12 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
         }
     }
 
-cleanup:
-    if (modeNameC) env->ReleaseStringUTFChars(modeName, modeNameC);
+    if (bufferNameC) env->ReleaseStringUTFChars(bufferName, bufferNameC);
     if (ensureCapacityNameC) env->ReleaseStringUTFChars(ensureCapacityName, ensureCapacityNameC);
     if (nextElementByteNameC)
         env->ReleaseStringUTFChars(nextElementByteName, nextElementByteNameC);
     if (verticesNameC) env->ReleaseStringUTFChars(verticesName, verticesNameC);
-    if (bufferNameC) env->ReleaseStringUTFChars(bufferName, bufferNameC);
+    if (modeNameC) env->ReleaseStringUTFChars(modeName, modeNameC);
 }
 
 JNIEXPORT jlong JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nInitModelCache(
@@ -558,6 +621,39 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
     delete reinterpret_cast<NativeModel *>(handle);
 }
 
+// Per-vertex 36-byte NEW_ENTITY record, byte-decoded from the shipped
+// binary's fast-path output (harness fast.buffer dumps):
+//   pos 3xf32 | color 4xu8 = (u8)(c*255) trunc | uv 2xf32
+//   overlay 2xs16 + light 2xs16 (raw ovl_light64 split)
+//   normal 3xs8 = (s8)(n*127) trunc | pad 0x00
+// Shared by the legacy fast path (write target = buffer + nextElementByte) and
+// the 26.x staging fast path (write target = ByteBufferBuilder.reserve ptr).
+static size_t writeNewEntityQuads(uint8_t *out, const std::vector<float> &fData,
+                                  const std::vector<uint64_t> &quadOvlLight, int actualQuads) {
+    size_t cursor = 0;
+    for (int q = 0; q < actualQuads; ++q) {
+        const float *quad = fData.data() + (size_t) q * 48;
+        const uint64_t ovl = quadOvlLight[q];
+        for (int v = 0; v < 4; ++v) {
+            const float *src = quad + v * 12;
+            uint8_t *o = out + cursor;
+            std::memcpy(o, src, 3 * sizeof(float));
+            o[12] = (uint8_t) (int) (src[3] * 255.0f);
+            o[13] = (uint8_t) (int) (src[4] * 255.0f);
+            o[14] = (uint8_t) (int) (src[5] * 255.0f);
+            o[15] = (uint8_t) (int) (src[6] * 255.0f);
+            std::memcpy(o + 16, src + 7, 2 * sizeof(float));
+            std::memcpy(o + 24, &ovl, sizeof(uint64_t));
+            o[32] = (uint8_t) (int8_t) (src[9] * 127.0f);
+            o[33] = (uint8_t) (int8_t) (src[10] * 127.0f);
+            o[34] = (uint8_t) (int8_t) (src[11] * 127.0f);
+            o[35] = 0;
+            cursor += 36;
+        }
+    }
+    return cursor;
+}
+
 // [B] Registered descriptor "(JLjava/lang/Object;[F[F[FIIIFFFF)V" — the extra
 // [F (stateArray) sits right after animArray, matching GeoModel.java:226-236.
 JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built_GeoModel_nComputeModelVertices(
@@ -569,17 +665,29 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
     if (!model || model->buckets.size() == 0) return;
 
     // [A] Direct-write fast-path availability (asm 16543-165eb):
-    // vertexConsumer != null && ensureCapacity cached && optional Sodium
-    // unwrap && IsInstanceOf(cached BufferBuilder class).
+    // vertexConsumer != null && a surface armed && optional Sodium unwrap &&
+    // IsInstanceOf(cached BufferBuilder class). Legacy surface = ensureCapacity
+    // + nextElementByte cached; staging surface = buffer field probed as
+    // ByteBufferBuilder (26.2/26.3), reserve resolved lazily at first write.
     bool builderAvailable = false;
+    bool stagingSurface = false;
     jobject builder = vertexConsumer;
-    if (vertexConsumer && g_ensureCapacityMethodID) {
+    if (vertexConsumer && g_BufferBuilderClass && g_bufferFieldID && g_verticesFieldID &&
+        ((g_nextElementByteFieldID && g_ensureCapacityMethodID) || g_stagingBufferField)) {
         if (g_SodiumBufferBuilderClass && g_sodiumBuilderFieldID &&
             env->IsInstanceOf(vertexConsumer, g_SodiumBufferBuilderClass)) {
             jobject inner = env->GetObjectField(vertexConsumer, g_sodiumBuilderFieldID);
             if (inner) builder = inner;
         }
         builderAvailable = env->IsInstanceOf(builder, g_BufferBuilderClass);
+        stagingSurface = builderAvailable && g_stagingBufferField && !g_nextElementByteFieldID;
+        // 36B-record guard: a non-entity stride would corrupt the mesh —
+        // fall back to the stride-agnostic submitVertices callback path.
+        if (stagingSurface && g_vertexSizeFieldID &&
+            env->GetIntField(builder, g_vertexSizeFieldID) != 36) {
+            stagingSurface = false;
+            builderAvailable = false;
+        }
     }
 
     jfloat *matricesData;
@@ -964,8 +1072,9 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
 
     if (actualVertices <= 0) return;
 
-    if (builderAvailable && builder) {
-        // [A] Direct-write fast path (asm 189c9-18a54, 19e53-19e9a):
+    bool fastWritten = false;
+    if (builderAvailable && builder && !stagingSurface) {
+        // [A] Legacy direct-write fast path (asm 189c9-18a54, 19e53-19e9a):
         //   ensureCapacity(staged quads * 144 bytes)       (pre-det-cull count:
         //                                                   shipped-binary probe
         //                                                   6 staged -> 864
@@ -990,39 +1099,59 @@ JNIEXPORT void JNICALL Java_com_elfmcys_yesstevemodel_geckolib3_geo_render_built
             return;
         }
 
-        // Per-vertex 36-byte NEW_ENTITY record, byte-decoded from the shipped
-        // binary's fast-path output (harness fast.buffer dumps):
-        //   pos 3xf32 | color 4xu8 = (u8)(c*255) trunc | uv 2xf32
-        //   overlay 2xs16 + light 2xs16 (raw ovl_light64 split)
-        //   normal 3xs8 = (s8)(n*127) trunc | pad 0x00
-        uint8_t *out = (uint8_t *) addr + nextElementByte;
-        size_t cursor = 0;
-        for (int q = 0; q < actualQuads; ++q) {
-            const float *quad = fData.data() + (size_t) q * 48;
-            const uint64_t ovl = quadOvlLight[q];
-            for (int v = 0; v < 4; ++v) {
-                const float *src = quad + v * 12;
-                uint8_t *o = out + cursor;
-                std::memcpy(o, src, 3 * sizeof(float));
-                o[12] = (uint8_t) (int) (src[3] * 255.0f);
-                o[13] = (uint8_t) (int) (src[4] * 255.0f);
-                o[14] = (uint8_t) (int) (src[5] * 255.0f);
-                o[15] = (uint8_t) (int) (src[6] * 255.0f);
-                std::memcpy(o + 16, src + 7, 2 * sizeof(float));
-                std::memcpy(o + 24, &ovl, sizeof(uint64_t));
-                o[32] = (uint8_t) (int8_t) (src[9] * 127.0f);
-                o[33] = (uint8_t) (int8_t) (src[10] * 127.0f);
-                o[34] = (uint8_t) (int8_t) (src[11] * 127.0f);
-                o[35] = 0;
-                cursor += 36;
-            }
-        }
+        size_t cursor = writeNewEntityQuads((uint8_t *) addr + nextElementByte, fData,
+                                            quadOvlLight, actualQuads);
 
         env->SetIntField(builder, g_verticesFieldID, (jint) (vertices + actualQuads * 4));
         env->SetIntField(builder, g_nextElementByteFieldID,
                          (jint) (nextElementByte + (jint) cursor));
         env->DeleteLocalRef(bufferObj);
-    } else if (g_NativeModelRendererClass && g_submitVerticesID) {
+        fastWritten = true;
+    } else if (builderAvailable && builder && stagingSurface) {
+        // [A2] 26.2/26.3 staging fast path. ByteBufferBuilder.reserve(int)
+        // advances the shared staging writeOffset, grows the allocation and
+        // returns the absolute write address (ByteBufferBuilder.java:49-55).
+        // Reserve the EXACT post-cull payload (quads*144) — unlike
+        // ensureCapacity, reserve consumes the bytes, so a pre-cull count
+        // would strand unwritten holes in the mesh. The builder's vertex
+        // count is then bumped; build()/storeMesh() derive the draw range
+        // from writeOffset (slice) + vertices (DrawState index count).
+        if (!g_reserveMethodID && !g_reserveProbeDead) {
+            jobject bbuf = env->GetObjectField(builder, g_bufferFieldID);
+            if (!bbuf) return;
+            jclass cls = env->GetObjectClass(bbuf);
+            if (cls) {
+                g_reserveMethodID = env->GetMethodID(cls, "reserve", "(I)J");
+                if (env->ExceptionCheck() || !g_reserveMethodID) {
+                    env->ExceptionClear();
+                    g_reserveMethodID = nullptr;
+                    g_reserveProbeDead = true;
+                }
+                env->DeleteLocalRef(cls);
+            }
+            env->DeleteLocalRef(bbuf);
+        }
+        if (g_reserveMethodID) {
+            jobject bbuf = env->GetObjectField(builder, g_bufferFieldID);
+            if (!bbuf) return;
+            jlong writePtr = env->CallLongMethod(bbuf, g_reserveMethodID,
+                                                 (jint) (actualQuads * 144));
+            if (env->ExceptionCheck()) {
+                // Capacity overflow / closed buffer: nothing was written
+                // (reserve does not advance on failure) — degrade to the
+                // stride-agnostic callback path below.
+                env->ExceptionClear();
+            } else if (writePtr) {
+                jint vertices = env->GetIntField(builder, g_verticesFieldID);
+                writeNewEntityQuads((uint8_t *) writePtr, fData, quadOvlLight, actualQuads);
+                env->SetIntField(builder, g_verticesFieldID, (jint) (vertices + actualQuads * 4));
+                fastWritten = true;
+            }
+            env->DeleteLocalRef(bbuf);
+        }
+        // reserve lookup dead -> fastWritten stays false -> submitVertices.
+    }
+    if (!fastWritten && g_NativeModelRendererClass && g_submitVerticesID) {
         // Slow path: submitVertices callback (asm 19b0d-19e40).
         jobject fBuf = env->NewDirectByteBuffer(
             fData.data(), static_cast<jlong>(actualVertices) * 12 * sizeof(float));
